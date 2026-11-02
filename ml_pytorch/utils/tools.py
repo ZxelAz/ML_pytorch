@@ -202,12 +202,14 @@ def loop_one_batch(
         running_num = 0
 
     if eval_model:
-        # Collect the scores and labels (kept on the device and concatenated
-        # once at the end, see eval_model)
-        all_scores.append(outputs.detach())
-        all_labels.append(labels.detach())
-        all_weights.append(event_weights.detach())
-        all_kl_values.append(kl_values.detach())
+        # Collect the scores and labels on the CPU (concatenated once at the
+        # end, see eval_model): the scores of all the events (e.g. a large
+        # training dataset, or several trainings sharing a GPU) would not fit
+        # in the GPU memory
+        all_scores.append(outputs.detach().cpu())
+        all_labels.append(labels.detach().cpu())
+        all_weights.append(event_weights.detach().cpu())
+        all_kl_values.append(kl_values.detach().cpu())
 
     return (
         running_loss,
