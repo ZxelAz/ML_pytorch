@@ -162,19 +162,23 @@ kfold_prepare: False
 normalize_weights_per_dataset: False
 
 # Class balancing via resampling. Only one of them can be True. When any of
-# them is used, the class weights above are set to 1.
+# them is used, the class weights above are set to 1. The number of events,
+# the sum of the weights and the class weights of each class in the training,
+# validation and test datasets are printed, to check the balance.
 # oversample_split: replicate the signal events to match the number of
-#   background events before the train/val/test split.
-#   With k_folds >= 2, oversample_split and split_oversample are equivalent:
-#   the oversampling is done after the split into folds, separately in the
-#   training and validation datasets, so that copies of an event never end up
-#   both in the training and test datasets. The test fold is never
-#   oversampled (every event gets one out-of-fold score): its events get the
-#   class weights above instead.
+#   background events before the train/val/test split, so copies of the same
+#   event can end up in different datasets.
+#   With k_folds >= 2 the test fold is taken first and never oversampled
+#   (every event gets one out-of-fold score, its events get the class weights
+#   above instead); the events of the other folds are oversampled and then
+#   split into training and validation, so copies of the same event can be
+#   both in the training and validation datasets.
 oversample_split: False
 # split_oversample: replicate the signal events to match the number of
 #   background events separately in the train, val and test datasets
-#   after the split.
+#   after the split, so the copies of an event stay in its dataset.
+#   With k_folds >= 2 the test fold is not oversampled (see above), the
+#   training and validation datasets are oversampled separately.
 split_oversample: False
 # undersample: keep only as many background events as signal events.
 undersample: False

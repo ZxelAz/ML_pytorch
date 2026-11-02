@@ -366,7 +366,11 @@ val_fraction: 0.2            # validation with the ratio train : val
 
 * **Splitting.** With `kfold_split: random` the events are assigned randomly to the folds, after the seeded shuffle. With `kfold_split: event` the fold of an event is `event % K`, computed from the `kfold_event_column` column (it must be saved in the input files). With `K = 2` this is the even/odd split. `test_fraction` is not used; the sum of the three fractions is still the fraction of the events read from the files.
 * **Seeds.** The event shuffle and the folds depend only on `seed`, so they are identical for all the folds (and for folds trained in separate jobs). The weight initialisation and dropout of fold `k` use the seed `seed * K + k`, so every fold starts from different weights.
-* **Oversampling.** `oversample_split` and `split_oversample` both oversample **after** the split into folds, separately in the training and validation datasets. Copies of an event can never be in both the training and the test datasets. The test fold is never oversampled, so each event gets exactly one out-of-fold score; the test events get the class-balancing weights instead. `undersample` drops events before the split, as usual.
+* **Oversampling.** The test fold is never oversampled, so every event gets exactly one out-of-fold score; its events get the class-balancing weights instead. The events of the other folds are oversampled in one of two orders:
+  * `oversample_split`: oversample first, then split into training and validation. Copies of the same event can therefore be in both training and validation.
+  * `split_oversample`: split into training and validation first, then oversample each of them separately.
+
+  `undersample` drops events before the split, as usual. For every dataset the number of events (and of distinct events), the sums of the weights and the class weights of each class are printed, together with the number of events shared between training, validation and test.
 
 ### Running
 

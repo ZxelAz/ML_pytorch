@@ -1207,6 +1207,14 @@ def load_data(cfg, seed):
         val_dataset = oversample_dataset(val_dataset, is_binary)
         test_dataset = oversample_dataset(test_dataset, is_binary)
 
+    class_names = [c["name"] for c in class_defs]
+    for name, dataset in [
+        ("Training", train_dataset),
+        ("Validation", val_dataset),
+        ("Test", test_dataset),
+    ]:
+        log_class_balance(name, *_balance_columns(dataset), class_names)
+
     # remove 1 because of the weights
     input_size = X_fts.size(1) - 1
 
@@ -1375,9 +1383,14 @@ def kfold_indices(fold_id, labels, cfg, seed, is_binary):
 
     The test events are the events of the fold, the other events are split
     into training and validation with the ratio train_fraction : val_fraction.
-    The test events are never oversampled, the training and validation events
-    are oversampled separately if oversample_split or split_oversample is set,
-    so copies of an event never end up both in the training and test datasets.
+    The test events are never oversampled, so every event gets exactly one
+    out-of-fold score and copies of an event never end up in the test dataset.
+    The other events are oversampled:
+      oversample_split: before the split into training and validation, so
+        copies of the same event can be both in the training and validation
+        datasets;
+      split_oversample: after the split, separately in the training and
+        validation datasets.
     """
     fold = cfg.fold
     test_idx = np.nonzero(fold_id == fold)[0]
@@ -1386,31 +1399,111 @@ def kfold_indices(fold_id, labels, cfg, seed, is_binary):
     gen = torch.Generator()
     gen.manual_seed(int(seed))
     other_idx = other_idx[torch.randperm(len(other_idx), generator=gen).numpy()]
+    # own generator for the oversampling, so that the folds do not depend on
+    # the global random state (the same with and without the k-fold cache)
+    rng = np.random.default_rng([int(seed), fold])
+
+    logger.info(f"Total size: {len(fold_id)}")
+    logger.info(f"Test size (fold {fold}, never oversampled): {len(test_idx)}")
+    logger.info(f"Training + validation size (other folds): {len(other_idx)}")
+
+    if cfg.oversample_split:
+        logger.info(
+            "Performing oversampling of the events of the other folds before "
+            "the split into training and validation (copies of the same event "
+            "can be both in the training and validation datasets, not in the "
+            "test fold)"
+        )
+        other_idx = oversample_indices(other_idx, labels, is_binary, rng)
+        logger.info(
+            f"Training + validation size after oversampling: {len(other_idx)}"
+        )
+
     train_size = round(
         len(other_idx) * cfg.train_fraction / (cfg.train_fraction + cfg.val_fraction)
     )
     train_idx = other_idx[:train_size]
     val_idx = other_idx[train_size:]
-
-    logger.info(f"Total size: {len(fold_id)}")
     logger.info(f"Training size: {len(train_idx)}")
     logger.info(f"Validation size: {len(val_idx)}")
-    logger.info(f"Test size (fold {fold}): {len(test_idx)}")
 
-    if cfg.oversample_split or cfg.split_oversample:
+    if cfg.split_oversample:
         logger.info(
-            "Performing oversampling after the split into folds, separately "
-            "in the training and validation datasets (not in the test fold)"
+            "Performing oversampling after the split into training and "
+            "validation, separately in the two datasets (not in the test fold)"
         )
-        # own generator, so that the folds do not depend on the global random
-        # state (the same with and without the k-fold cache)
-        rng = np.random.default_rng([int(seed), fold])
         train_idx = oversample_indices(train_idx, labels, is_binary, rng)
         val_idx = oversample_indices(val_idx, labels, is_binary, rng)
         logger.info(f"Training size after oversampling: {len(train_idx)}")
         logger.info(f"Validation size after oversampling: {len(val_idx)}")
 
     return train_idx, val_idx, test_idx
+
+
+def log_class_balance(name, labels, event_weights, class_weights, class_names, event_ids=None):
+    """Log, for each class of a dataset, the number of events (and of distinct
+    events, if their ids are given, e.g. with oversampling), the sum of the
+    event weights, the class weight and the sum of the weights used in the
+    loss (event weight * class weight, negative weights clamped to 0 as in the
+    training loop), so that the balance of the classes can be checked."""
+    labels = np.asarray(labels).astype(np.int64).flatten()
+    event_weights = np.asarray(event_weights, dtype=np.float64).flatten()
+    class_weights = np.asarray(class_weights, dtype=np.float64).flatten()
+    loss_weights = np.clip(event_weights * class_weights, 0, None)
+    tot_events = len(labels)
+    tot_loss_weights = loss_weights.sum()
+    logger.info(f"{name} dataset: {tot_events} events, class balance:")
+    sums = []
+    for c, class_name in enumerate(class_names):
+        mask = labels == c
+        n = int(mask.sum())
+        w = event_weights[mask]
+        lw = loss_weights[mask]
+        cw = np.unique(class_weights[mask])
+        sums.append(lw.sum())
+        unique = ""
+        if event_ids is not None:
+            # the weights of the copies of an event (oversampling) are summed,
+            # since the copies are not independent events
+            ids, inverse = np.unique(np.asarray(event_ids)[mask], return_inverse=True)
+            lw_distinct = np.bincount(inverse, weights=lw, minlength=len(ids))
+            unique = f", distinct {len(ids)}"
+        else:
+            lw_distinct = lw
+        # effective number of independent events of the weights used in the loss
+        ess = (
+            lw_distinct.sum() ** 2 / (lw_distinct**2).sum()
+            if n and (lw_distinct**2).sum() > 0
+            else 0.0
+        )
+        logger.info(
+            f"  {name} class {c} ({class_name}): events {n} "
+            f"({n / max(tot_events, 1):.2%}){unique}, "
+            f"sum event weights {w.sum():.6g} (mean {w.mean() if n else 0:.4g}, "
+            f"negative {int((w < 0).sum())}), "
+            f"class weight {', '.join(f'{x:.6g}' for x in cw)}, "
+            f"sum loss weights {lw.sum():.6g} "
+            f"({lw.sum() / tot_loss_weights if tot_loss_weights else 0:.2%}), "
+            f"effective events {ess:.6g}"
+        )
+    nonzero = [x for x in sums if x > 0]
+    if len(nonzero) > 1:
+        logger.info(
+            f"  {name}: ratio max / min of the sum of the loss weights of the "
+            f"classes {max(nonzero) / min(nonzero):.4f} (1 = balanced)"
+        )
+
+
+def log_overlap(train_idx, val_idx, test_idx):
+    """Log how many distinct events are shared by the k-fold datasets."""
+    train_u, val_u, test_u = (np.unique(i) for i in (train_idx, val_idx, test_idx))
+    logger.info(
+        f"Distinct events shared by training and validation: "
+        f"{np.intersect1d(train_u, val_u, assume_unique=True).size}, by training "
+        f"and test: {np.intersect1d(train_u, test_u, assume_unique=True).size}, "
+        f"by validation and test: "
+        f"{np.intersect1d(val_u, test_u, assume_unique=True).size}"
+    )
 
 
 def make_kfold_loaders(cfg, arrays, meta, seed):
@@ -1422,6 +1515,24 @@ def make_kfold_loaders(cfg, arrays, meta, seed):
     train_idx, val_idx, test_idx = kfold_indices(
         fold_id, labels, cfg, seed, meta["is_binary"]
     )
+    class_names = [c["name"] for c in meta["class_info"]]
+    event_weights = np.asarray(arrays["fts"][:, -1])
+    clsw = np.asarray(arrays["clsw"][:, 0])
+    clsw_bal = np.asarray(arrays["clsw_bal"][:, 0])
+    for name, idx, cw in [
+        ("Training", train_idx, clsw),
+        ("Validation", val_idx, clsw),
+        ("Test", test_idx, clsw_bal),
+    ]:
+        log_class_balance(
+            name,
+            labels[idx],
+            event_weights[idx],
+            cw[idx],
+            class_names,
+            event_ids=idx,
+        )
+    log_overlap(train_idx, val_idx, test_idx)
     batch_size = cfg.batch_size
     sources = [arrays["fts"], arrays["lbl"], arrays["clsw"], arrays["k"]]
     # the test events get the class weights that balance the classes, since
@@ -1597,6 +1708,18 @@ def extract_param_value(s, param):
     value_str = value_str.replace("m", "-").replace("p", ".")
 
     return float(value_str)
+
+
+def _balance_columns(dataset):
+    """Labels, event weights and class weights of a TensorDataset, or of a
+    (nested) Subset of one, gathering only these columns."""
+    if isinstance(dataset, torch.utils.data.TensorDataset):
+        fts, lbl, clsw = dataset.tensors[:3]
+        return lbl, fts[:, -1], clsw[:, 0]
+    if isinstance(dataset, torch.utils.data.Subset):
+        idx = torch.as_tensor(dataset.indices, dtype=torch.long)
+        return tuple(t[idx] for t in _balance_columns(dataset.dataset))
+    raise TypeError(f"Unsupported dataset type: {type(dataset).__name__}")
 
 
 def _dataset_tensors(dataset):
