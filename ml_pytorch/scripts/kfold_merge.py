@@ -105,11 +105,80 @@ def summarise_metrics(fold_metrics):
     return summary
 
 
-def merge_scores(fold_dirs, out_dir):
-    """Concatenate the test (out-of-fold) and training scores of the folds."""
+def check_fold_configs(fold_dirs):
+    """Check that the folds are the folds 0 ... K-1 of the same k-fold split
+    (same data, fractions, oversampling, seed, k_folds and kfold_split)."""
+    from ml_pytorch.utils.dataset import kfold_cache_hash
+
+    hashes = set()
+    for k, d in enumerate(fold_dirs):
+        cfg_file = f"{d}/config_parameters.yml"
+        if not os.path.exists(cfg_file):
+            logger.warning(f"No {cfg_file}: cannot check the config of fold {k}")
+            continue
+        fold_cfg = OmegaConf.load(cfg_file)
+        if fold_cfg.get("fold", None) != k:
+            raise ValueError(f"{d} is fold {fold_cfg.get('fold', None)}, not fold {k}")
+        hashes.add(kfold_cache_hash(fold_cfg))
+    if len(hashes) > 1:
+        raise ValueError(
+            "The folds were trained with different data, fractions, oversampling, "
+            "seed, k_folds or kfold_split: they are not the folds of the same split"
+        )
+    logger.info(f"Checked that the {len(fold_dirs)} folds are the folds of the same split")
+
+
+def check_test_folds(arrays):
+    """Check that the test events of the folds are disjoint and cover all the
+    events exactly once (rows saved by ml_train with the k-folding)."""
+    if not all("event_rows_test" in a.files for a in arrays):
+        logger.warning("No event rows saved in the folds: cannot check the test folds")
+        return
+    n_events = {int(a["n_events_total"]) for a in arrays}
+    if len(n_events) != 1:
+        raise ValueError(f"The folds have different numbers of events: {n_events}")
+    n_events = n_events.pop()
+    rows = np.concatenate([a["event_rows_test"] for a in arrays])
+    counts = np.bincount(rows, minlength=n_events)
+    if len(counts) != n_events or (counts != 1).any():
+        raise ValueError(
+            f"The test folds are not a partition of the {n_events} events: "
+            f"{int((counts == 0).sum())} events in no test fold, "
+            f"{int((counts > 1).sum())} in more than one"
+        )
+    for a in arrays:
+        if len(a["event_rows_test"]) != len(a["score_lbl_array_test"]):
+            raise ValueError("The test rows do not match the test scores")
+    logger.info(
+        f"Checked that the {len(arrays)} test folds are disjoint and cover all "
+        f"the {n_events} events once"
+    )
+
+
+def merge_scores(fold_dirs, out_dir, max_train_per_fold=None):
+    """Concatenate the test (out-of-fold) and training scores of the folds.
+
+    Every event is in the training dataset of K-1 folds, so only a random
+    fraction 1/(K-1) of the training scores of each fold is kept (about one
+    score per event in total), unless max_train_per_fold is given.
+    """
     arrays = [
         np.load(f"{d}/score_lbl_array.npz", allow_pickle=True) for d in fold_dirs
     ]
+    check_test_folds(arrays)
+
+    rng = np.random.default_rng(0)
+    k_folds = len(arrays)
+    train_keep = []
+    for a in arrays:
+        n_train = len(a["score_lbl_array_train"])
+        n_keep = (
+            min(n_train, max_train_per_fold)
+            if max_train_per_fold is not None
+            else int(np.ceil(n_train / max(1, k_folds - 1)))
+        )
+        train_keep.append(np.sort(rng.choice(n_train, n_keep, replace=False)))
+
     merged = {
         "score_lbl_array_test": np.concatenate(
             [a["score_lbl_array_test"] for a in arrays]
@@ -120,9 +189,11 @@ def merge_scores(fold_dirs, out_dir):
             [np.full(len(a["score_lbl_array_test"]), k) for k, a in enumerate(arrays)]
         ),
         "score_lbl_array_train": np.concatenate(
-            [a["score_lbl_array_train"] for a in arrays]
+            [a["score_lbl_array_train"][i] for a, i in zip(arrays, train_keep)]
         ),
-        "dataset_idx_train": np.concatenate([a["dataset_idx_train"] for a in arrays]),
+        "dataset_idx_train": np.concatenate(
+            [a["dataset_idx_train"][i] for a, i in zip(arrays, train_keep)]
+        ),
         # the out-of-fold scores cover all the events
         "train_test_fractions": np.array(
             [float(np.mean([a["train_test_fractions"][0] for a in arrays])), 1.0]
@@ -130,6 +201,10 @@ def merge_scores(fold_dirs, out_dir):
         "num_classes": arrays[0]["num_classes"],
         "class_info": arrays[0]["class_info"],
     }
+    if all("event_rows_test" in a.files for a in arrays):
+        merged["event_rows_test"] = np.concatenate(
+            [a["event_rows_test"] for a in arrays]
+        )
     out_file = f"{out_dir}/score_lbl_array_oof.npz"
     np.savez(out_file, **merged)
     logger.info(
@@ -248,6 +323,7 @@ def merge_kfold(main_dir, cfg, ratio=None, plots=True):
     kfold_dir = f"{main_dir}/kfold"
     os.makedirs(kfold_dir, exist_ok=True)
 
+    check_fold_configs(fold_dirs)
     fold_metrics = [read_fold_metrics(d) for d in fold_dirs]
     summary = summarise_metrics(fold_metrics)
     summary_file = f"{kfold_dir}/kfold_summary.yml"

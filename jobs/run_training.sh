@@ -24,6 +24,8 @@
 #   --ratio                 Use average-ratio ONNX aggregation (ml_onnx -ar)
 #   -k, --k-folds INT       K-fold training: train the K folds (one job each,
 #                           same seed) and merge them with ml_kfold_merge
+#   --no-kfold-cache        K-fold: every fold loads the events itself, instead
+#                           of loading them once in OUTDIR/kfold_cache
 #   --load-last             Resume from latest checkpoint instead of restarting
 #   --time HH:MM:SS         Slurm wall-clock time limit (default: 8:30:00)
 #   --mem-per-cpu MB        Slurm memory per CPU in MB (default: 4000)
@@ -40,6 +42,7 @@ NODES=1
 INIT_SEED=0
 RATIO=false
 K_FOLDS=0
+KFOLD_CACHE=true
 LOAD_LAST=false
 MODE="train"
 NO_SLURM=false
@@ -67,7 +70,10 @@ Optional:
   --ratio                 Average-ratio ONNX aggregation (ml_onnx -ar)
   -k, --k-folds INT       K-fold training: train the K folds in parallel (same
                           seed, outputs in OUTDIR/fold_<k>) and merge them with
-                          ml_kfold_merge (not combinable with -n > 1)
+                          ml_kfold_merge (not combinable with -n > 1). The
+                          events are loaded once in OUTDIR/kfold_cache and
+                          memory-mapped by all the folds
+  --no-kfold-cache        K-fold: every fold loads the events itself
   --load-last             Resume from latest checkpoint
   --time HH:MM:SS         Slurm wall-clock time limit (default: 8:30:00)
   --mem-per-cpu MB        Slurm memory per CPU in MB (default: 4000)
@@ -109,6 +115,7 @@ while [[ $# -gt 0 ]]; do
         -s|--init-seed)    INIT_SEED="$2"; shift 2 ;;
         --ratio)           RATIO=true; shift ;;
         -k|--k-folds)      K_FOLDS="$2"; shift 2 ;;
+        --no-kfold-cache)  KFOLD_CACHE=false; shift ;;
         --load-last)       LOAD_LAST=true; shift ;;
         --time)            SLURM_TIME="$2"; shift 2 ;;
         --mem-per-cpu)     SLURM_MEM="$2"; shift 2 ;;
@@ -152,6 +159,11 @@ fi
 
 TRAININGS_PER_NODE=$(( (N_TRAININGS + NODES - 1) / NODES ))
 
+# K-fold cache: the events are loaded once and memory-mapped by all the folds
+USE_KFOLD_CACHE=false
+[[ "$K_FOLDS" -ge 2 && "$KFOLD_CACHE" == true ]] && USE_KFOLD_CACHE=true
+KFOLD_CACHE_DIR="${OUT_DIR}/kfold_cache"
+
 
 # ─── Helper: canonical run directory for a given seed ────────────────────────
 # (with --k-folds the index is the fold: OUT_DIR/fold_<seed - INIT_SEED>)
@@ -182,6 +194,7 @@ build_submit_args() {
     )
     [[ "$RATIO"     == true ]] && args+=(--ratio)
     [[ "$LOAD_LAST" == true ]] && args+=(--load-last)
+    [[ "$KFOLD_CACHE" != true ]] && args+=(--no-kfold-cache)
     [[ ${#EXTRA_ARGS[@]} -gt 0 ]] && args+=(-- "${EXTRA_ARGS[@]}")
     printf '%s\0' "${args[@]}"
 }
@@ -217,10 +230,24 @@ if [[ -z "${SLURM_JOB_ID:-}" && "$NO_SLURM" != true ]]; then
     else
         # Array job per node + dependent postproc job
         ARRAY_MAX=$(( NODES - 1 ))
+        PREPARE_DEPENDENCY=()
+        if [[ "$USE_KFOLD_CACHE" == true ]]; then
+            # the k-fold cache is prepared once, before the array tasks
+            mapfile -d '' PREPARE_ARGS < <(build_submit_args prepare)
+            PREPARE_JOB_ID=$(sbatch --parsable \
+                --job-name="ml_kfold_cache" \
+                --output="${SLURM_LOG_DIR}/slurm-%j.out" \
+                --gres="gpu:1" \
+                "${SBATCH_RESOURCES[@]}" \
+                "$SCRIPT_PATH" "${PREPARE_ARGS[@]}")
+            echo "  K-fold cache job submitted: ${PREPARE_JOB_ID}"
+            PREPARE_DEPENDENCY=(--dependency="afterok:${PREPARE_JOB_ID}")
+        fi
         mapfile -d '' TRAIN_ARGS < <(build_submit_args train)
         echo "Submitting array job: ${NODES} nodes × ${TRAININGS_PER_NODE} trainings on ${GPUS_PER_NODE} GPU(s) each (total: ${N_TRAININGS})..."
         TRAIN_JOB_ID=$(sbatch --parsable \
             --job-name="ml_train_array" \
+            "${PREPARE_DEPENDENCY[@]}" \
             --array="0-${ARRAY_MAX}" \
             --output="${SLURM_LOG_DIR}/slurm-%A_%a.out" \
             --gres="gpu:${GPUS_PER_NODE}" \
@@ -299,6 +326,7 @@ run_one_training() {
     [[ "$LOAD_LAST" != true ]] && train_args+=(--overwrite)
     if [[ "$K_FOLDS" -ge 2 ]]; then
         train_args+=(-s "$INIT_SEED" --k-folds "$K_FOLDS" --fold "$(( seed - INIT_SEED ))")
+        [[ "$USE_KFOLD_CACHE" == true ]] && train_args+=(--kfold-cache "$KFOLD_CACHE_DIR")
     elif [[ "$N_TRAININGS" -gt 1 ]]; then
         train_args+=(-s "$seed")
     fi
@@ -315,6 +343,20 @@ run_one_training() {
 
     echo "Starting training: seed=${seed} on GPU ${gpu} -> ${run_dir}"
     ml_train "${train_args[@]}" "${comet_args[@]}"
+}
+
+# ─── K-fold cache: load the events once for all the folds ────────────────────
+run_prepare() {
+    # all the CPUs of the job for loading the events
+    export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-$SLURM_CPUS}"
+    export MKL_NUM_THREADS="$OMP_NUM_THREADS"
+    local prepare_args=(
+        -c "$CONFIG_FILE" -s "$INIT_SEED" --k-folds "$K_FOLDS"
+        --kfold-cache "$KFOLD_CACHE_DIR" --kfold-prepare
+    )
+    [[ ${#EXTRA_ARGS[@]} -gt 0 ]] && prepare_args+=("${EXTRA_ARGS[@]}")
+    echo "Preparing the k-fold cache in ${KFOLD_CACHE_DIR}..."
+    ml_train "${prepare_args[@]}" || { echo "Error: k-fold cache preparation failed"; exit 1; }
 }
 
 # ─── Post-processing: collect best models + ONNX aggregation ──────────────────
@@ -388,6 +430,10 @@ case "$MODE" in
 
         N_NODE_TRAININGS=$(( NODE_END - NODE_START + 1 ))
 
+        # single job: prepare the k-fold cache before starting the folds (with
+        # several array tasks it is prepared by a separate job before them)
+        [[ "$USE_KFOLD_CACHE" == true && "$NODES" -eq 1 ]] && run_prepare
+
         # GPUs actually visible to this job (Slurm sets CUDA_VISIBLE_DEVICES
         # to the allocated ones, which are then numbered 0..N-1)
         N_GPUS="$GPUS_PER_NODE"
@@ -421,6 +467,10 @@ case "$MODE" in
         if [[ "$N_TRAININGS" -gt 1 && "$NODES" -eq 1 ]]; then
             run_postproc
         fi
+        ;;
+
+    prepare)
+        run_prepare
         ;;
 
     postproc)

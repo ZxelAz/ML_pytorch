@@ -4,10 +4,14 @@
 # DNN_12_01_02_1e-4_e20drop95_minDelta1em5_ggF_VBF_vars_NVBFjets_2024_parking.yml
 # with a larger batch for the ~60M events.
 #
-# Run the 20 folds in parallel on the two 8-GPU nodes (4 array tasks with 4
-# GPUs each, 5 folds per task) and merge them:
+# Run the 20 folds at the same time on one full 8-GPU node (t3gpu0X: 8 GTX
+# 1080 Ti, 40 CPUs, ~245 GB) and merge them:
 #   ./jobs/run_training.sh -c <this config> -o <output dir> \
-#     -k 20 -p 4 -g 4 --cpus 20 --mem-per-cpu 6000 --time 24:00:00 --ratio
+#     -k 20 -g 8 --cpus 40 --mem-per-cpu 6000 --time 48:00:00 --ratio
+# The events are first loaded once into <output dir>/kfold_cache, which the 20
+# fold processes memory-map (the events take the RAM once, not 20 times).
+# Folds i run on GPU i % 8 (3 folds on GPUs 0-3, 2 on GPUs 4-7), with 2 CPUs
+# each.
 input_variables: bkg_morphing_dnn_ggf_vbf_NVBFjets_input_variables
 
 run2: False

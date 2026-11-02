@@ -1,5 +1,6 @@
 import datetime
 import importlib
+import logging
 import importlib.util
 import os
 import subprocess
@@ -59,6 +60,40 @@ def make_output_dir(main_dir, overwrite):
                 sys.exit(0)
 
 
+def resolve_input_variables(cfg):
+    """Convert the name of an input variables module into the list of columns."""
+    if isinstance(cfg.input_variables, str):
+        logger = logging.getLogger()
+        logger.info("Get Input variables from dnn_inputs")
+        logger.info(cfg.input_variables)
+        dnn_input_variables_file = importlib.import_module(
+            f"ml_pytorch.defaults.{cfg.input_variables}"
+        )
+
+        cfg.input_variables = create_DNN_columns_list(
+            cfg.run2, dnn_input_variables_file.dnn_input_variables
+        )
+
+
+def prepare_kfold_cache(cfg):
+    """Load the events once, shuffle them, assign them to the folds and save
+    them in the k-fold cache (cfg.kfold_cache), which all the folds then
+    memory-map instead of loading the events again."""
+    if not cfg.kfold_cache:
+        raise ValueError("--kfold-prepare needs --kfold-cache")
+    os.makedirs(cfg.kfold_cache, exist_ok=True)
+    logger = setup_logger(f"{cfg.kfold_cache}/logger_kfold_cache.log", cfg.verbosity)
+    logger.info(f"Preparing the k-fold cache in {cfg.kfold_cache}")
+    resolve_input_variables(cfg)
+    set_seed(cfg.seed, cfg.deterministic)
+    load_data(cfg, cfg.seed)
+
+
+def kfold_subprocess_cmd(*extra_args):
+    # the options given later override the earlier ones
+    return [sys.executable, "-m", "ml_pytorch.scripts.train", *sys.argv[1:], *extra_args]
+
+
 def run_all_folds(cfg, main_dir):
     """Train all the folds of the k-fold training one after the other, each
     in its own ml_train process with the output in <main_dir>/fold_<k>, and
@@ -73,25 +108,31 @@ def run_all_folds(cfg, main_dir):
     make_output_dir(main_dir, cfg.overwrite)
     setup_logger(f"{main_dir}/logger_kfold.log", cfg.verbosity)
     os.system(f"cp {args.config} {main_dir}")
+    # the events are loaded only once, in the k-fold cache
+    cache_dir = cfg.kfold_cache or f"{main_dir}/kfold_cache"
+    cfg.kfold_cache = cache_dir
     OmegaConf.save(cfg, f"{main_dir}/config_parameters.yml")
+
+    cmd = kfold_subprocess_cmd(
+        "--k-folds", str(cfg.k_folds), "--kfold-cache", cache_dir, "--kfold-prepare"
+    )
+    print(" ".join(cmd))
+    subprocess.run(cmd, check=True)
 
     for fold in range(cfg.k_folds):
         fold_dir = f"{main_dir}/fold_{fold}"
         print(f"\n\n\n=== Training fold {fold} of {cfg.k_folds} -> {fold_dir}")
-        # the options given later override the earlier ones
-        cmd = [
-            sys.executable,
-            "-m",
-            "ml_pytorch.scripts.train",
-            *sys.argv[1:],
+        cmd = kfold_subprocess_cmd(
             "--k-folds",
             str(cfg.k_folds),
             "--fold",
             str(fold),
+            "--kfold-cache",
+            cache_dir,
             "-o",
             fold_dir,
             "--overwrite",
-        ]
+        )
         print(" ".join(cmd))
         subprocess.run(cmd, check=True)
 
@@ -160,6 +201,9 @@ def main():
     if k_folds >= 2:
         # fail before training if the final ONNX model cannot be built
         check_kfold_onnx_cfg(cfg)
+    if cfg.kfold_prepare:
+        prepare_kfold_cache(cfg)
+        return
     if k_folds >= 2 and cfg.fold is None:
         run_all_folds(cfg, main_dir)
         return
@@ -244,16 +288,7 @@ def main():
     logger.info("configs")
     logger.info("cfg:\n - %s", "\n - ".join(str(it) for it in cfg.items()))
 
-    if isinstance(cfg.input_variables, str):
-        logger.info("Get Input variables from dnn_inputs")
-        logger.info(cfg.input_variables)
-        dnn_input_variables_file = importlib.import_module(
-            f"ml_pytorch.defaults.{cfg.input_variables}"
-        )
-
-        cfg.input_variables = create_DNN_columns_list(
-            cfg.run2, dnn_input_variables_file.dnn_input_variables
-        )
+    resolve_input_variables(cfg)
 
     input_variables = cfg.input_variables
     logger.info(input_variables)
@@ -304,8 +339,13 @@ def main():
         class_info,
     ) = load_data(cfg, cfg.seed)
 
-    # plot the input variable distributions of signal and background before training
-    if cfg.input_plots:
+    # plot the input variable distributions of signal and background before
+    # training. With the k-fold cache the events are the same for all the
+    # folds, so they are plotted only for fold 0 (the plots copy the events
+    # in memory)
+    if cfg.input_plots and k_folds >= 2 and cfg.kfold_cache and cfg.fold != 0:
+        logger.info("Input variable distributions plotted only for fold 0")
+    elif cfg.input_plots:
         logger.info("\n\n\n")
         logger.info("Plotting the input variable distributions")
         input_plots_dir = plot_input_variables_from_loaders(
@@ -686,6 +726,16 @@ def main():
                 train_test_fractions=train_test_fractions,
                 num_classes=np.array(num_classes),
                 class_info=np.array(class_info, dtype=object),
+                # k-fold: rows of the test events and number of events, to
+                # check that the test folds are disjoint and cover all the events
+                **(
+                    {
+                        "event_rows_test": test_loader.event_rows,
+                        "n_events_total": np.array(test_loader.n_events_total),
+                    }
+                    if hasattr(test_loader, "event_rows")
+                    else {}
+                ),
             )
 
         # plot the signal and background distributions

@@ -10,8 +10,11 @@ import awkward as ak
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pyarrow.dataset as ds
+import hashlib
 import json
+import queue
 import re
+import threading
 from urllib.parse import urlsplit
 
 logger = logging.getLogger(__name__)
@@ -941,11 +944,21 @@ def load_data(cfg, seed):
 
     k_folds = cfg.k_folds or 0
     kfold = k_folds >= 2
+    prepare_only = bool(cfg.get("kfold_prepare", False))
     if kfold:
-        check_kfold_cfg(cfg)
+        check_kfold_cfg(cfg, need_fold=not prepare_only)
         logger.info(
             f"K-fold training: fold {cfg.fold} of {k_folds}, split {cfg.kfold_split}"
         )
+        cache_dir = cfg.get("kfold_cache", None)
+        if cache_dir and kfold_cache_exists(cache_dir):
+            if prepare_only:
+                check_kfold_cache(cache_dir, cfg)
+                logger.info(f"K-fold cache {cache_dir} already prepared")
+                return None
+            return load_data_from_kfold_cache(cfg, seed)
+    elif prepare_only:
+        raise ValueError("kfold_prepare needs k_folds >= 2")
     event_column = (
         cfg.kfold_event_column if kfold and cfg.kfold_split == "event" else None
     )
@@ -1118,6 +1131,8 @@ def load_data(cfg, seed):
         ],
         dim=1,
     ).transpose(1, 0)
+    # free the per-class copies of the events
+    del X_per_class, clsw_tensors
 
     logger.info(f"X_fts shape: {X_fts.shape}")
     logger.info(f"X_lbl shape: {X_lbl.shape}")
@@ -1135,21 +1150,30 @@ def load_data(cfg, seed):
     X_clsw_bal = X_clsw_bal[idx]
 
     if kfold:
-        train_dataset, val_dataset, test_dataset = split_kfold(
-            X_fts, X_lbl, X_clsw, X_clsw_bal, X_k, cfg, seed, is_binary
-        )
-        return make_loaders(
-            cfg,
-            train_dataset,
-            val_dataset,
-            test_dataset,
-            batch_size,
-            X_fts.size(1) - 1,
-            num_classes,
-            class_defs,
-            # every event of the test fold must get a score
-            drop_last_test=False,
-        )
+        X_k = assign_fold_ids(X_k, cfg)
+        arrays = {
+            "fts": X_fts,
+            "lbl": X_lbl,
+            "clsw": X_clsw,
+            "clsw_bal": X_clsw_bal,
+            "k": X_k,
+        }
+        meta = {
+            "input_size": X_fts.size(1) - 1,
+            "num_classes": num_classes,
+            "is_binary": is_binary,
+            "n_events": tot_num_events,
+            "class_info": get_class_info(class_defs),
+        }
+        cache_dir = cfg.get("kfold_cache", None)
+        if cache_dir:
+            save_kfold_cache(cache_dir, arrays, meta, cfg)
+            if prepare_only:
+                return None
+            # use the memory-mapped cache, shared with the other folds
+            del arrays, X_fts, X_lbl, X_clsw, X_clsw_bal, X_k
+            return load_data_from_kfold_cache(cfg, seed)
+        return make_kfold_loaders(cfg, arrays, meta, seed)
 
     train_size = math.floor(tot_num_events * cfg.train_fraction)
     val_size = math.floor(tot_num_events * cfg.val_fraction)
@@ -1245,15 +1269,7 @@ def make_loaders(
         )
         logger.info("Test loader size: %d", len(test_loader))
 
-    class_info = [
-        {
-            "name": c["name"],
-            "lbl": c["lbl"],
-            "class_idx": c["class_idx"],
-            "datasets": list(c["datasets"]),
-        }
-        for c in class_defs
-    ]
+    class_info = get_class_info(class_defs)
 
     return (
         training_loader,
@@ -1266,8 +1282,20 @@ def make_loaders(
     )
 
 
-def check_kfold_cfg(cfg):
-    if cfg.fold is None or not 0 <= cfg.fold < cfg.k_folds:
+def get_class_info(class_defs):
+    return [
+        {
+            "name": c["name"],
+            "lbl": c["lbl"],
+            "class_idx": c["class_idx"],
+            "datasets": list(c["datasets"]),
+        }
+        for c in class_defs
+    ]
+
+
+def check_kfold_cfg(cfg, need_fold=True):
+    if need_fold and (cfg.fold is None or not 0 <= cfg.fold < cfg.k_folds):
         raise ValueError(
             f"fold must be between 0 and k_folds - 1 = {cfg.k_folds - 1}, got {cfg.fold}"
         )
@@ -1292,68 +1320,236 @@ def check_kfold_onnx_cfg(cfg):
         )
 
 
-def split_kfold(X_fts, X_lbl, X_clsw, X_clsw_bal, X_k, cfg, seed, is_binary):
-    """Split the (already shuffled) events for the fold ``cfg.fold`` of the
-    k-fold training.
-
-    The test dataset are the events of the fold, the other events are split
-    into training and validation with the ratio train_fraction : val_fraction.
-    The test events get the class weights that balance the classes and are
-    never oversampled, the training and validation datasets are oversampled
-    separately if oversample_split or split_oversample is set.
-    """
-    k_folds = cfg.k_folds
-    fold = cfg.fold
-    tot_num_events = X_fts.shape[0]
-
+def assign_fold_ids(X_k, cfg):
+    """Store in the third column of X_k the fold of each (already shuffled)
+    event: event % k_folds (computed when loading) or, for kfold_split
+    random, the position in the shuffled order % k_folds. Since the shuffle
+    depends only on the seed, the folds are the same for all the folds."""
     if cfg.kfold_split == "event":
         fold_id = X_k[:, 2].to(torch.int64)
+        if (fold_id < 0).any():
+            raise ValueError("Missing event numbers for kfold_split event")
     else:
-        # the events are already shuffled with the seed, so this is a random
-        # assignment that is the same for all the folds
-        fold_id = torch.arange(tot_num_events) % k_folds
+        fold_id = torch.arange(X_k.shape[0]) % cfg.k_folds
         X_k = X_k.clone()
         X_k[:, 2] = fold_id.to(X_k.dtype)
-
-    for k in range(k_folds):
+    for k in range(cfg.k_folds):
         logger.info(f"Fold {k}: {int((fold_id == k).sum())} events")
+    return X_k
 
-    test_idx = torch.nonzero(fold_id == fold).flatten()
-    other_idx = torch.nonzero(fold_id != fold).flatten()
+
+def oversample_indices(idx, labels, is_binary, rng):
+    """Oversample (by repeating the indices) the minority class(es) of the
+    events ``idx``, as oversample_dataset does with the events themselves,
+    and shuffle them with the numpy generator ``rng``."""
+    lbl = labels[idx]
+    classes = np.unique(lbl)
+    n_per_class = {c: int((lbl == c).sum()) for c in classes}
+    if is_binary:
+        if n_per_class.get(1, 0) > n_per_class.get(0, 0):
+            raise ValueError(
+                "Number of signal events is greater than number of background events."
+            )
+        to_oversample = [1]
+        n_target = n_per_class.get(0, 0)
+    else:
+        to_oversample = list(classes)
+        n_target = max(n_per_class.values())
+    out = []
+    for c in classes:
+        idx_c = idx[lbl == c]
+        if c in to_oversample and 0 < len(idx_c) < n_target:
+            factor = n_target // len(idx_c) + 1
+            logger.info(
+                f"Class {int(c)}: oversampling {len(idx_c)} -> {n_target} (factor {factor})"
+            )
+            idx_c = np.tile(idx_c, factor)[:n_target]
+        out.append(idx_c)
+    out = np.concatenate(out)
+    return out[rng.permutation(len(out))]
+
+
+def kfold_indices(fold_id, labels, cfg, seed, is_binary):
+    """Indices of the training, validation and test events of the fold
+    ``cfg.fold``.
+
+    The test events are the events of the fold, the other events are split
+    into training and validation with the ratio train_fraction : val_fraction.
+    The test events are never oversampled, the training and validation events
+    are oversampled separately if oversample_split or split_oversample is set,
+    so copies of an event never end up both in the training and test datasets.
+    """
+    fold = cfg.fold
+    test_idx = np.nonzero(fold_id == fold)[0]
+    other_idx = np.nonzero(fold_id != fold)[0]
 
     gen = torch.Generator()
     gen.manual_seed(int(seed))
-    other_idx = other_idx[torch.randperm(len(other_idx), generator=gen)]
+    other_idx = other_idx[torch.randperm(len(other_idx), generator=gen).numpy()]
     train_size = round(
         len(other_idx) * cfg.train_fraction / (cfg.train_fraction + cfg.val_fraction)
     )
     train_idx = other_idx[:train_size]
     val_idx = other_idx[train_size:]
 
-    logger.info(f"Total size: {tot_num_events}")
+    logger.info(f"Total size: {len(fold_id)}")
     logger.info(f"Training size: {len(train_idx)}")
     logger.info(f"Validation size: {len(val_idx)}")
     logger.info(f"Test size (fold {fold}): {len(test_idx)}")
-
-    train_dataset = torch.utils.data.TensorDataset(
-        X_fts[train_idx], X_lbl[train_idx], X_clsw[train_idx], X_k[train_idx]
-    )
-    val_dataset = torch.utils.data.TensorDataset(
-        X_fts[val_idx], X_lbl[val_idx], X_clsw[val_idx], X_k[val_idx]
-    )
-    test_dataset = torch.utils.data.TensorDataset(
-        X_fts[test_idx], X_lbl[test_idx], X_clsw_bal[test_idx], X_k[test_idx]
-    )
 
     if cfg.oversample_split or cfg.split_oversample:
         logger.info(
             "Performing oversampling after the split into folds, separately "
             "in the training and validation datasets (not in the test fold)"
         )
-        train_dataset = oversample_dataset(train_dataset, is_binary)
-        val_dataset = oversample_dataset(val_dataset, is_binary)
+        # own generator, so that the folds do not depend on the global random
+        # state (the same with and without the k-fold cache)
+        rng = np.random.default_rng([int(seed), fold])
+        train_idx = oversample_indices(train_idx, labels, is_binary, rng)
+        val_idx = oversample_indices(val_idx, labels, is_binary, rng)
+        logger.info(f"Training size after oversampling: {len(train_idx)}")
+        logger.info(f"Validation size after oversampling: {len(val_idx)}")
 
-    return train_dataset, val_dataset, test_dataset
+    return train_idx, val_idx, test_idx
+
+
+def make_kfold_loaders(cfg, arrays, meta, seed):
+    """Loaders of the fold ``cfg.fold``, taking the batches of events from the
+    ``arrays`` (in-memory tensors or memory-mapped arrays of the k-fold cache)
+    by index."""
+    labels = np.asarray(arrays["lbl"])
+    fold_id = np.asarray(arrays["k"][:, 2]).astype(np.int64)
+    train_idx, val_idx, test_idx = kfold_indices(
+        fold_id, labels, cfg, seed, meta["is_binary"]
+    )
+    batch_size = cfg.batch_size
+    sources = [arrays["fts"], arrays["lbl"], arrays["clsw"], arrays["k"]]
+    # the test events get the class weights that balance the classes, since
+    # they are never oversampled
+    test_sources = [arrays["fts"], arrays["lbl"], arrays["clsw_bal"], arrays["k"]]
+
+    training_loader = IndexedBatchLoader(sources, train_idx, batch_size, drop_last=True)
+    logger.info("Training loader size: %d", len(training_loader))
+    val_loader = None
+    if not cfg.eval_model:
+        val_loader = IndexedBatchLoader(sources, val_idx, batch_size, drop_last=True)
+        logger.info("Validation loader size: %d", len(val_loader))
+    test_loader = None
+    if cfg.eval or cfg.eval_model:
+        # every event of the test fold must get a score
+        test_loader = IndexedBatchLoader(
+            test_sources, test_idx, batch_size, drop_last=False
+        )
+        logger.info("Test loader size: %d", len(test_loader))
+        # rows of the test events, to check in the merge that the test folds
+        # are disjoint and cover all the events
+        test_loader.event_rows = test_idx
+        test_loader.n_events_total = meta["n_events"]
+
+    return (
+        training_loader,
+        val_loader,
+        test_loader,
+        meta["input_size"],
+        batch_size,
+        meta["num_classes"],
+        meta["class_info"],
+    )
+
+
+# ---------------------------------------------------------------------------
+# K-fold cache: the events are loaded, shuffled and assigned to the folds only
+# once, and saved as .npy files that all the folds memory-map. The pages of a
+# memory-mapped file are shared by all the processes of a node, so the events
+# take the RAM only once, however many folds run in parallel.
+# ---------------------------------------------------------------------------
+
+KFOLD_CACHE_ARRAYS = ["fts", "lbl", "clsw", "clsw_bal", "k"]
+KFOLD_CACHE_META = "kfold_cache_meta.json"
+
+# config options that change the content of the k-fold cache
+KFOLD_CACHE_KEYS = [
+    "input_variables",
+    "preprocess_variables_functions",
+    "run2",
+    "signal_sample",
+    "background_sample",
+    "signal_region",
+    "background_region",
+    "signal_dataset",
+    "background_dataset",
+    "classes",
+    "data_dirs",
+    "parquet_dir",
+    "data_format",
+    "novars",
+    "train_fraction",
+    "val_fraction",
+    "test_fraction",
+    "normalize_weights_per_dataset",
+    "oversample_split",
+    "split_oversample",
+    "undersample",
+    "seed",
+    "k_folds",
+    "kfold_split",
+    "kfold_event_column",
+    "pad_value",
+]
+
+
+def kfold_cache_hash(cfg):
+    from omegaconf import OmegaConf
+
+    values = {
+        k: OmegaConf.to_container(cfg[k], resolve=True)
+        if OmegaConf.is_config(cfg.get(k, None))
+        else cfg.get(k, None)
+        for k in KFOLD_CACHE_KEYS
+    }
+    # the seed can be given as a string from the command line
+    values["seed"] = int(values["seed"])
+    return hashlib.sha256(
+        json.dumps(values, sort_keys=True, default=str).encode()
+    ).hexdigest()
+
+
+def kfold_cache_exists(cache_dir):
+    return os.path.exists(os.path.join(cache_dir, KFOLD_CACHE_META))
+
+
+def check_kfold_cache(cache_dir, cfg):
+    with open(os.path.join(cache_dir, KFOLD_CACHE_META)) as f:
+        meta = json.load(f)
+    if meta["hash"] != kfold_cache_hash(cfg):
+        raise ValueError(
+            f"The k-fold cache {cache_dir} was made with a different config "
+            "(data, fractions, oversampling, seed, k_folds or kfold_split): "
+            "remove it or use another kfold_cache directory"
+        )
+    return meta
+
+
+def save_kfold_cache(cache_dir, arrays, meta, cfg):
+    os.makedirs(cache_dir, exist_ok=True)
+    for name in KFOLD_CACHE_ARRAYS:
+        np.save(os.path.join(cache_dir, f"{name}.npy"), np.asarray(arrays[name]))
+    meta = dict(meta, hash=kfold_cache_hash(cfg))
+    # written last: its presence marks a complete cache
+    with open(os.path.join(cache_dir, KFOLD_CACHE_META), "w") as f:
+        json.dump(meta, f, indent=2)
+    logger.info(f"Saved the k-fold cache of {meta['n_events']} events in {cache_dir}")
+
+
+def load_data_from_kfold_cache(cfg, seed):
+    cache_dir = cfg.kfold_cache
+    meta = check_kfold_cache(cache_dir, cfg)
+    logger.info(f"Reading the events from the k-fold cache {cache_dir}")
+    arrays = {
+        name: np.load(os.path.join(cache_dir, f"{name}.npy"), mmap_mode="r")
+        for name in KFOLD_CACHE_ARRAYS
+    }
+    return make_kfold_loaders(cfg, arrays, meta, seed)
 
 
 def root_to_local(path_or_url: str):
@@ -1405,13 +1601,90 @@ def extract_param_value(s, param):
 
 def _dataset_tensors(dataset):
     """Return the tensors of a TensorDataset, or of a (nested) Subset of one,
-    in the order of the dataset."""
+    or of an IndexedBatchLoader, in the order of the dataset."""
+    if isinstance(dataset, IndexedBatchLoader):
+        return dataset.gather()
     if isinstance(dataset, torch.utils.data.TensorDataset):
         return list(dataset.tensors)
     if isinstance(dataset, torch.utils.data.Subset):
         idx = torch.as_tensor(dataset.indices, dtype=torch.long)
         return [t[idx] for t in _dataset_tensors(dataset.dataset)]
     raise TypeError(f"Unsupported dataset type: {type(dataset).__name__}")
+
+
+class IndexedBatchLoader:
+    """Loader taking the batches of the events ``indices`` from ``sources``
+    (tensors or numpy arrays, also memory-mapped, with the events on the
+    first axis), in the order of ``indices``.
+
+    Used by the k-fold training, where the events of a fold are a subset (with
+    repetitions when oversampling) of all the events: the events are not
+    copied, only gathered batch by batch. The next batch is prepared in a
+    background thread while the current one is used.
+    """
+
+    def __init__(self, sources, indices, batch_size, drop_last=True):
+        self.sources = sources
+        self.indices = np.asarray(indices, dtype=np.int64)
+        self.batch_size = batch_size
+        self.drop_last = drop_last
+        self.num_events = len(self.indices)
+
+    def __len__(self):
+        if self.drop_last:
+            return self.num_events // self.batch_size
+        return math.ceil(self.num_events / self.batch_size)
+
+    def num_bytes(self):
+        return self.num_events * sum(
+            np.dtype(np.asarray(s[:1]).dtype).itemsize * int(np.prod(s.shape[1:]))
+            for s in self.sources
+        )
+
+    def _take(self, idx):
+        return tuple(
+            torch.as_tensor(np.asarray(s[idx]))
+            if isinstance(s, np.ndarray)
+            else s[torch.from_numpy(idx)]
+            for s in self.sources
+        )
+
+    def gather(self):
+        """All the events of the loader, in its order."""
+        return list(self._take(self.indices))
+
+    @property
+    def dataset(self):
+        """The events of the loader as a TensorDataset (copied in memory)."""
+        return torch.utils.data.TensorDataset(*self.gather())
+
+    def _batches(self):
+        for i in range(len(self)):
+            start = i * self.batch_size
+            yield self._take(self.indices[start : start + self.batch_size])
+
+    def __iter__(self):
+        batches = queue.Queue(maxsize=2)
+        done = object()
+
+        def produce():
+            try:
+                for batch in self._batches():
+                    batches.put(batch)
+            except BaseException as e:
+                batches.put(e)
+            batches.put(done)
+
+        thread = threading.Thread(target=produce, daemon=True)
+        thread.start()
+        while True:
+            batch = batches.get()
+            if batch is done:
+                break
+            if isinstance(batch, BaseException):
+                raise batch
+            yield batch
+        thread.join()
 
 
 class DeviceBatchLoader:
@@ -1459,11 +1732,14 @@ def loaders_to_device(loaders, device, max_memory_fraction=0.5):
     if device.type != "cuda":
         return loaders
 
-    datasets_bytes = sum(
-        sum(t.element_size() * t.nelement() for t in _dataset_tensors(loader.dataset))
-        for loader in loaders
-        if loader is not None
-    )
+    def num_bytes(loader):
+        if isinstance(loader, IndexedBatchLoader):
+            return loader.num_bytes()
+        return sum(
+            t.element_size() * t.nelement() for t in _dataset_tensors(loader.dataset)
+        )
+
+    datasets_bytes = sum(num_bytes(loader) for loader in loaders if loader is not None)
     free_bytes, _ = torch.cuda.mem_get_info(device)
     if datasets_bytes > max_memory_fraction * free_bytes:
         logger.warning(
@@ -1472,17 +1748,27 @@ def loaders_to_device(loaders, device, max_memory_fraction=0.5):
             "the batches to the GPU one by one"
         )
         device = torch.device("cpu")
+        if any(isinstance(loader, IndexedBatchLoader) for loader in loaders):
+            # the k-fold loaders already take the batches by index
+            return loaders
     else:
         logger.info(
             f"Moving the datasets to {device} ({datasets_bytes / 1e9:.2f} GB)"
         )
-    return [
-        (
-            DeviceBatchLoader(
-                loader.dataset, loader.batch_size, device, drop_last=loader.drop_last
-            )
-            if loader is not None
-            else None
+    out = []
+    for loader in loaders:
+        if loader is None:
+            out.append(None)
+            continue
+        new = DeviceBatchLoader(
+            loader if isinstance(loader, IndexedBatchLoader) else loader.dataset,
+            loader.batch_size,
+            device,
+            drop_last=loader.drop_last,
         )
-        for loader in loaders
-    ]
+        # keep the rows of the test events of the k-fold training
+        for attr in ["event_rows", "n_events_total"]:
+            if hasattr(loader, attr):
+                setattr(new, attr, getattr(loader, attr))
+        out.append(new)
+    return out

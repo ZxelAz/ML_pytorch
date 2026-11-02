@@ -225,6 +225,18 @@ parser.add_argument(
     type=str,
 )
 parser.add_argument(
+    "--kfold-cache",
+    default=None,
+    help="K-fold: directory of the cache of the events, loaded once and memory-mapped by all the folds",
+    type=str,
+)
+parser.add_argument(
+    "--kfold-prepare",
+    default=None,
+    help="K-fold: only load the events and save them in the --kfold-cache directory",
+    action="store_true",
+)
+parser.add_argument(
     "--kfold-onnx",
     default=None,
     choices=["average", "event"],

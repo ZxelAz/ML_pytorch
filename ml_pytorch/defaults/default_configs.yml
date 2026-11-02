@@ -132,6 +132,17 @@ onnx_ratio: False
 #            never seen in the training can be evaluated with any fold.
 #            Needs kfold_split: event.
 kfold_onnx: average
+# Directory of the k-fold cache. If set, the events are loaded, shuffled and
+# assigned to the folds only once (ml_train --kfold-prepare, done
+# automatically when training all the folds with ml_train or
+# jobs/run_training.sh --k-folds) and saved there as .npy files, which every
+# fold memory-maps: the events take the RAM only once per node, however many
+# folds run in parallel, and each fold keeps only the indices of its events.
+# The cache is reused if it was made with the same data, fractions,
+# oversampling, seed, k_folds and kfold_split, otherwise ml_train stops.
+kfold_cache: null
+# Only prepare the k-fold cache (see kfold_cache) and exit.
+kfold_prepare: False
 
 # ---------------------------------------------------------------------------
 # Event weights and class balancing
