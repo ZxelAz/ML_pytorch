@@ -206,8 +206,15 @@ learning_rate: 1e-2
 # Learning rate schedule (see ml_pytorch/utils/learning_rate_schedules.py):
 #   constant   : constant learning rate
 #   linear     : linear decrease from learning_rate to 0 over all the epochs
-#   eX_dropYY  : constant for X epochs, then multiplied by 0.YY every epoch
-#                (available: e5_drop75, e5_drop95, e20_drop75, e20_drop95, e30_drop95)
+#   eX_dropYY  : constant for the first X epochs, then multiplied by 0.YY at
+#                every epoch, i.e. learning_rate * 0.YY^(epoch - X) from epoch X
+#                (epochs counted from 0). X is any integer number of epochs,
+#                YY any digits, read as the decimals of the factor:
+#                  e20_drop95 -> 20 epochs, factor 0.95
+#                  e5_drop75  -> 5 epochs,  factor 0.75
+#                  e10_drop5  -> 10 epochs, factor 0.5
+#                  e10_drop05 -> 10 epochs, factor 0.05
+#                  e0_drop99  -> factor 0.99 from the first epoch
 learning_rate_schedule: linear
 
 # Stop the training if the validation metric (eval_param) does not improve
