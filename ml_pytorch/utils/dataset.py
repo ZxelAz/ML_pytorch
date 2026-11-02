@@ -387,14 +387,21 @@ def get_variables(
 
             count_fields = {k: count_field(dataset.schema, k) for k in missing_counts}
 
+            if event_column is not None and event_column not in dataset.schema.names:
+                raise ValueError(
+                    f"Column {event_column} (kfold_event_column) needed for "
+                    f"kfold_split event not found in the parquet files of {file_name}"
+                )
             # read the parquet files only once and only the needed columns
-            # (flat and jagged inputs, weight and fields to count the objects)
+            # (flat and jagged inputs, weight, fields to count the objects and
+            # event number for the k-fold split)
             columns = list(
                 dict.fromkeys(
                     [x for x in vars if x not in missing_counts]
                     + jagged_variables
                     + list(count_fields.values())
                     + ["weight"]
+                    + ([event_column] if event_column is not None else [])
                 )
             )
             table = dataset.to_table(columns=columns, use_threads=True)
@@ -1272,6 +1279,17 @@ def check_kfold_cfg(cfg):
         raise ValueError(
             "train_fraction and val_fraction must be positive with the k-folding"
         )
+    check_kfold_onnx_cfg(cfg)
+
+
+def check_kfold_onnx_cfg(cfg):
+    if cfg.kfold_onnx not in ["average", "event"]:
+        raise ValueError(f"kfold_onnx must be average or event, got {cfg.kfold_onnx}")
+    if cfg.kfold_onnx == "event" and cfg.kfold_split != "event":
+        raise ValueError(
+            "kfold_onnx: event (the model chosen by event number) needs "
+            "kfold_split: event"
+        )
 
 
 def split_kfold(X_fts, X_lbl, X_clsw, X_clsw_bal, X_k, cfg, seed, is_binary):
@@ -1397,18 +1415,22 @@ def _dataset_tensors(dataset):
 
 
 class DeviceBatchLoader:
-    """Drop-in replacement of the DataLoader for datasets that fit in the GPU
-    memory.
+    """Drop-in replacement of the DataLoader that takes the batches as slices
+    of the dataset tensors held on `device`.
 
-    The whole dataset is copied once to the device and the batches are views
-    (slices) of it, so there are no worker processes, no collation and no
-    host-to-device copy per batch. For the small DNNs used here this is the
-    main bottleneck of the training. The batches have the same order and the
-    same drop_last behaviour as the DataLoader with shuffle=False.
+    On the GPU, the whole dataset is copied once to the device, so there are no
+    worker processes, no collation and no host-to-device copy per batch. For
+    the small DNNs used here this is the main bottleneck of the training. On
+    the CPU (datasets too large for the GPU memory) the batches are zero-copy
+    slices of the tensors in RAM, copied to the GPU in the training loop: this
+    avoids the per-event indexing and collation of the DataLoader, which
+    dominate with large batches. The batches have the same order and the same
+    drop_last behaviour as the DataLoader with shuffle=False.
     """
 
     def __init__(self, dataset, batch_size, device, drop_last=True):
-        self.dataset = dataset
+        # the dataset itself is not kept, so that the original tensors (e.g.
+        # of a Subset, which are copied here) can be freed
         self.batch_size = batch_size
         self.drop_last = drop_last
         self.tensors = [t.to(device) for t in _dataset_tensors(dataset)]
@@ -1429,9 +1451,10 @@ def loaders_to_device(loaders, device, max_memory_fraction=0.5):
     """Replace the DataLoaders with DeviceBatchLoaders holding the data on
     `device`.
 
-    The loaders are left unchanged if the device is not a GPU, or if the
-    datasets would take more than `max_memory_fraction` of the free GPU memory.
-    `None` loaders are kept as they are.
+    The loaders are left unchanged if the device is not a GPU. If the datasets
+    would take more than `max_memory_fraction` of the free GPU memory, they are
+    kept in RAM and the batches are sliced there and copied to the GPU one by
+    one. `None` loaders are kept as they are.
     """
     if device.type != "cuda":
         return loaders
@@ -1445,11 +1468,14 @@ def loaders_to_device(loaders, device, max_memory_fraction=0.5):
     if datasets_bytes > max_memory_fraction * free_bytes:
         logger.warning(
             f"Datasets ({datasets_bytes / 1e9:.2f} GB) do not fit in the free GPU "
-            f"memory ({free_bytes / 1e9:.2f} GB): using the standard DataLoaders"
+            f"memory ({free_bytes / 1e9:.2f} GB): keeping them in RAM and copying "
+            "the batches to the GPU one by one"
         )
-        return loaders
-
-    logger.info(f"Moving the datasets to {device} ({datasets_bytes / 1e9:.2f} GB)")
+        device = torch.device("cpu")
+    else:
+        logger.info(
+            f"Moving the datasets to {device} ({datasets_bytes / 1e9:.2f} GB)"
+        )
     return [
         (
             DeviceBatchLoader(

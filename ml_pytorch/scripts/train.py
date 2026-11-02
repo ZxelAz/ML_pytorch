@@ -13,7 +13,11 @@ from ml_pytorch.utils.args_train import args
 
 # PyTorch TensorBoard support
 # from torch.utils.tensorboard import SummaryWriter
-from ml_pytorch.utils.dataset import load_data, loaders_to_device
+from ml_pytorch.utils.dataset import (
+    check_kfold_onnx_cfg,
+    load_data,
+    loaders_to_device,
+)
 from ml_pytorch.utils.early_stopper import EarlyStopper
 from ml_pytorch.utils.lumitext import get_lumitext
 from ml_pytorch.utils.setup_logger import setup_logger
@@ -153,6 +157,9 @@ def main():
     main_dir = cfg.output_dir
 
     k_folds = cfg.k_folds or 0
+    if k_folds >= 2:
+        # fail before training if the final ONNX model cannot be built
+        check_kfold_onnx_cfg(cfg)
     if k_folds >= 2 and cfg.fold is None:
         run_all_folds(cfg, main_dir)
         return

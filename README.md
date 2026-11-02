@@ -172,7 +172,7 @@ A ready-to-edit multi-class example is provided at `configs/hh4b_sig_bkg_classif
 | `eval`, `roc`, `histos`, `history`, `onnx` | toggle the post-training outputs |
 | `gpus` | comma-separated GPU indices, or unset for CPU |
 | `seed` | seed for both event shuffling and weight initialisation (python, numpy and torch, also on GPU) |
-| `k_folds`, `fold`, `kfold_split`, `kfold_event_column`, `onnx_ratio` | k-fold training, see [K-fold training](#k-fold-training) |
+| `k_folds`, `fold`, `kfold_split`, `kfold_event_column`, `kfold_onnx`, `onnx_ratio` | k-fold training, see [K-fold training](#k-fold-training) |
 | `deterministic` | use only deterministic algorithms, so that trainings with the same seed are identical also on GPU (slower) |
 | `pad_value` | value marking padded entries (missing objects); must match the PocketCoffea fill value. Used to pad the missing objects and the `None` values of the inputs when loading the dataset, to not count padded objects when creating a missing `<collection>_N` from parquet files and, in `MaskedBatchNorm1d`, to exclude padded entries from the normalisation statistics |
 | `pad_fill_value` | `MaskedBatchNorm1d` only: value assigned to padded entries at the output of the layer, or `"learn"` for a learnable per-feature value. The real values there are standardised and then scaled/shifted by the learnable weight and bias, so 0 corresponds to the mean of the real values only at initialisation; a fixed value does not follow the learned scale/shift |
@@ -295,6 +295,7 @@ K-fold training (see K-fold training)
   -f, --fold INT               Train only this fold (default: all the folds, then merge)
   --kfold-split {random,event} Assign the folds randomly or by event number % k_folds
   --onnx-ratio                 Also build the average-of-ratios k-fold ONNX model
+  --kfold-onnx {average,event} Final k-fold ONNX model: average over the folds or fold event % k_folds
 
 Evaluation / output
   -ev, --eval                  Evaluate the model on the test set (no training)
@@ -356,6 +357,7 @@ k_folds: 5
 kfold_split: random          # or: event
 kfold_event_column: event    # used with kfold_split: event
 onnx_ratio: False            # also build the average-of-ratios ONNX (reweighting)
+kfold_onnx: average          # final ONNX model: average | event (see Outputs)
 train_fraction: 0.8          # the non-test events are split into training and
 val_fraction: 0.2            # validation with the ratio train : val
 ```
@@ -389,6 +391,9 @@ All the folds use the same `seed`. `--load-model`/`--eval-model` work for one fo
 * `kfold_onnx/average_model_kfold.onnx`: the average of the outputs of the K models (input `args_0`, output `avg_score`). Use it for events that were not used in the training.
 * `kfold_onnx/average_ratio_model_kfold.onnx` (`onnx_ratio: True` or `--ratio`): the average over the folds of the ratio of the outputs (`p/(1-p)` for one output node, `p1/p0` for two), output `avg_w`, for the background reweighting. Equivalent to `ml_onnx -ar` on the fold models. For the 4-node multiclass morphing, use `ml_onnx -ar -mc -i kfold_onnx/folds` instead.
 * `kfold_onnx/event_fold_model_kfold.onnx` (and `event_fold_ratio_model_kfold.onnx` with the ratio), only with `kfold_split: event`. It takes two inputs: `args_0`, the input variables `(N, n_features)` float32, and `event`, the event number `(N,)` int64. Each event is evaluated with the model of fold `event % K`, which is the model that was **not** trained on it. Use it for the events that were used in the training (e.g. the training regions).
+* `kfold_onnx/final_model_kfold.onnx`: a copy of the combined model chosen with `kfold_onnx`. Its ratio variant is used when `onnx_ratio` is set. The choice is also written in `kfold/kfold_summary.yml` (`final_onnx`).
+  * `kfold_onnx: average` (default) gives the average over the folds. Use it when the model is applied to events that were not used in the training, e.g. the background reweighting applied in a separate region.
+  * `kfold_onnx: event` gives the event-number-aware model and needs `kfold_split: event`. Use it when the model is also applied to the training events, e.g. the sig/bkg or ggF/VBF classifiers. Events whose number was never seen in the training can be evaluated by any fold, so the same model works for them too.
 
 The combined models are checked against the per-fold models with onnxruntime when they are built. To use the per-fold models by hand with `K = 2`, apply `model_fold0.onnx` to the **even** events and `model_fold1.onnx` to the **odd** events.
 
@@ -455,11 +460,12 @@ cd jobs/
 
 The models are small DNNs, so the training is limited by the data loading and the Python overhead rather than by the GPU compute:
 
-- `data_on_gpu: True` (default) copies the whole datasets to the GPU once and takes the batches as slices of it, removing the DataLoader workers and the per-batch host-to-device copies. It falls back to the DataLoaders if the datasets take more than half of the free GPU memory.
+- `data_on_gpu: True` (default) copies the whole datasets to the GPU once and takes the batches as slices of it, removing the DataLoader workers and the per-batch host-to-device copies. If the datasets take more than half of the free GPU memory (e.g. tens of millions of events on an 11 GB GPU), they are kept in RAM: the batches are sliced there and copied to the GPU one by one. This is still much faster than the DataLoaders, which index and collate the events one at a time. `--no-data-on-gpu` uses the standard DataLoaders.
 - The loss and accuracy are accumulated on the GPU (no synchronisation at every batch) and the validation/evaluation run without building the autograd graph.
 - A larger `batch_size` (e.g. 2048-8192) is the biggest further speed-up, but it changes the training dynamics: scale the learning rate accordingly.
 - `tf32: True` (default) speeds up the matrix multiplications on Ampere or newer GPUs.
 - Multiple GPUs: one GPU is enough to saturate a single small training, and `--gpus 0,1` (DataParallel) is usually *slower*. Use the GPUs to run several trainings (seeds) at the same time with `run_training.sh --gpus-per-node`. Several trainings can also share one GPU.
+- K-fold with large datasets: every fold is a separate process that loads all the events into RAM. The number of folds that can run at the same time on a node is usually limited by its RAM, not by its GPUs. Spread the folds over several array tasks with `-k K -p NODES -g GPUS --cpus CPUS --mem-per-cpu MB`. Measure the memory of one fold first, e.g. with `sacct -j <job id> --format=MaxRSS`. See `configs/hh4b_bkg_reweighting/DNN_12_01_03_*_kfold20.yml` for an example on two 8-GPU nodes.
 - After all trainings finish, the best ONNX model from each run is copied to `best_models/` and `ml_onnx` is called to aggregate them. With `--ratio` the `-ar` flag is passed (average ratio, used for background reweighting); without it, a plain aggregation is performed.
 - The input variable name is read automatically from the training config YAML (`input_variables` field).
 - If `jobs/comet_token.key` exists, Comet ML logging is enabled automatically (see [COMET integration](#comet-integration)).

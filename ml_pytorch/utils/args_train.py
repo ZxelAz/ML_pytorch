@@ -225,6 +225,13 @@ parser.add_argument(
     type=str,
 )
 parser.add_argument(
+    "--kfold-onnx",
+    default=None,
+    choices=["average", "event"],
+    help="K-fold: final ONNX model, average over the folds or model of the fold event %% k_folds",
+    type=str,
+)
+parser.add_argument(
     "--onnx-ratio",
     default=None,
     help="K-fold: build also the ONNX model of the average of the ratios of the outputs of the folds (reweighting)",

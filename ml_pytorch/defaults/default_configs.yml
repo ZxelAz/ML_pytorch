@@ -120,6 +120,18 @@ kfold_event_column: event
 # the folds (p / (1 - p) for 1 output node, p1 / p0 for 2), used for the
 # background reweighting.
 onnx_ratio: False
+# Combined ONNX model of the k-fold training saved as
+# <output_dir>/kfold_onnx/final_model_kfold.onnx (the other combinations
+# and the model of each fold are saved too):
+#   average: average over the folds of the outputs (of their ratio with
+#            onnx_ratio: True). For events not used in the training, e.g. the
+#            background reweighting applied in a separate region.
+#   event  : the model of the fold event % k_folds, i.e. the one not trained
+#            on the event (second input: int64 event number). For events used
+#            in the training, e.g. the sig/bkg or ggF/VBF classifiers. Events
+#            never seen in the training can be evaluated with any fold.
+#            Needs kfold_split: event.
+kfold_onnx: average
 
 # ---------------------------------------------------------------------------
 # Event weights and class balancing
@@ -214,8 +226,11 @@ gpus: '0'
 # Copy the whole train/val/test datasets to the GPU once and take the batches
 # directly from there, instead of using DataLoader workers and copying every
 # batch to the GPU. Much faster for small models; num_workers and pin_memory
-# are then not used. Falls back to the DataLoaders on CPU or if the datasets
-# take more than half of the free GPU memory.
+# are then not used. If the datasets take more than half of the free GPU
+# memory they are kept in RAM and the batches are taken as slices there and
+# copied to the GPU one by one (still much faster than the DataLoaders, which
+# index and collate the events one by one). No effect on CPU. False uses the
+# standard DataLoaders.
 data_on_gpu: True
 # Allow TensorFloat-32 matrix multiplications on Ampere (or newer) GPUs
 # (ignored with deterministic: True).

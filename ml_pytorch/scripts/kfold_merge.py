@@ -37,6 +37,17 @@ KFOLD_ONNX_NAMES = {
     "event": "event_fold_model_kfold.onnx",
     "event_ratio": "event_fold_ratio_model_kfold.onnx",
 }
+# copy of the combined model chosen with kfold_onnx (and onnx_ratio)
+KFOLD_FINAL_ONNX_NAME = "final_model_kfold.onnx"
+
+
+def final_onnx_key(kfold_onnx, ratio):
+    """Key in KFOLD_ONNX_NAMES of the final model chosen with kfold_onnx."""
+    if kfold_onnx == "average":
+        return "average_ratio" if ratio else "average"
+    if kfold_onnx == "event":
+        return "event_ratio" if ratio else "event"
+    raise ValueError(f"kfold_onnx must be average or event, got {kfold_onnx}")
 
 
 def get_fold_dirs(main_dir, k_folds):
@@ -180,8 +191,9 @@ def check_kfold_models(fold_files, kfold_files, n_features, k_folds):
         logger.info(f"Checked {model_file} against the fold models")
 
 
-def merge_onnx(fold_dirs, out_dir, ratio, event_split):
-    """Copy the best model of each fold and build the combined models."""
+def merge_onnx(fold_dirs, out_dir, ratio, event_split, kfold_onnx="average"):
+    """Copy the best model of each fold, build the combined models and save
+    the one chosen with kfold_onnx as the final model."""
     folds_dir = f"{out_dir}/folds"
     os.makedirs(folds_dir, exist_ok=True)
     fold_files = []
@@ -212,7 +224,15 @@ def merge_onnx(fold_dirs, out_dir, ratio, event_split):
         kfold_files[key] = f"{out_dir}/{KFOLD_ONNX_NAMES[key]}"
         save_onnx_model(model, kfold_files[key])
     check_kfold_models(fold_files, kfold_files, n_features, len(fold_dirs))
-    return kfold_files
+
+    final_key = final_onnx_key(kfold_onnx, ratio)
+    kfold_files["final"] = f"{out_dir}/{KFOLD_FINAL_ONNX_NAME}"
+    shutil.copy(kfold_files[final_key], kfold_files["final"])
+    logger.info(
+        f"Final k-fold model (kfold_onnx: {kfold_onnx}, ratio: {ratio}): "
+        f"{kfold_files['final']} = {os.path.basename(kfold_files[final_key])}"
+    )
+    return kfold_files, final_key
 
 
 def merge_kfold(main_dir, cfg, ratio=None, plots=True):
@@ -221,6 +241,8 @@ def merge_kfold(main_dir, cfg, ratio=None, plots=True):
         raise ValueError(f"k_folds must be >= 2 to merge the folds, got {k_folds}")
     ratio = cfg.onnx_ratio if ratio is None else ratio
     event_split = cfg.kfold_split == "event"
+    if cfg.kfold_onnx == "event" and not event_split:
+        raise ValueError("kfold_onnx: event needs kfold_split: event")
 
     fold_dirs = get_fold_dirs(main_dir, k_folds)
     kfold_dir = f"{main_dir}/kfold"
@@ -229,9 +251,6 @@ def merge_kfold(main_dir, cfg, ratio=None, plots=True):
     fold_metrics = [read_fold_metrics(d) for d in fold_dirs]
     summary = summarise_metrics(fold_metrics)
     summary_file = f"{kfold_dir}/kfold_summary.yml"
-    OmegaConf.save(OmegaConf.create(summary), summary_file)
-    logger.info(f"K-fold summary saved in {summary_file}:\n{OmegaConf.to_yaml(summary)}")
-    print(OmegaConf.to_yaml(summary))
 
     merged = merge_scores(fold_dirs, kfold_dir)
 
@@ -254,11 +273,23 @@ def merge_kfold(main_dir, cfg, ratio=None, plots=True):
         )
 
     if cfg.onnx:
-        kfold_files = merge_onnx(
-            fold_dirs, f"{main_dir}/kfold_onnx", ratio, event_split
+        kfold_files, final_key = merge_onnx(
+            fold_dirs, f"{main_dir}/kfold_onnx", ratio, event_split, cfg.kfold_onnx
         )
         for key, f in kfold_files.items():
             logger.info(f"K-fold ONNX model ({key}): {f}")
+        summary["final_onnx"] = {
+            "file": kfold_files["final"],
+            "kfold_onnx": cfg.kfold_onnx,
+            "model": final_key,
+            "inputs": (
+                ["args_0", "event"] if final_key.startswith("event") else ["args_0"]
+            ),
+        }
+
+    OmegaConf.save(OmegaConf.create(summary), summary_file)
+    logger.info(f"K-fold summary saved in {summary_file}:\n{OmegaConf.to_yaml(summary)}")
+    print(OmegaConf.to_yaml(summary))
 
     logger.info(f"Merged the {k_folds} folds in {main_dir}")
 
@@ -289,6 +320,12 @@ def main():
         help="Build also the ONNX models of the average of the ratios of the outputs (reweighting)",
     )
     parser.add_argument(
+        "--kfold-onnx",
+        default=None,
+        choices=["average", "event"],
+        help="Final ONNX model (overrides config): average over the folds or model of the fold event %% k_folds",
+    )
+    parser.add_argument(
         "--no-plots", action="store_true", help="Do not plot the out-of-fold scores"
     )
     args = parser.parse_args()
@@ -313,6 +350,8 @@ def main():
     cfg = OmegaConf.merge(cfg, OmegaConf.load(config))
     if args.k_folds is not None:
         cfg.k_folds = args.k_folds
+    if args.kfold_onnx is not None:
+        cfg.kfold_onnx = args.kfold_onnx
     merge_kfold(main_dir, cfg, ratio=args.ratio, plots=not args.no_plots)
 
 
