@@ -211,9 +211,19 @@ undersample: False
 ML_model: DNN_model
 
 # Seed of the random number generators (python, numpy and torch, also on
-# GPU): it fixes the event shuffling, the train/val/test split, the weight
-# initialisation and the dropout. On CPU two trainings with the same seed are
-# identical, on GPU they can still slightly differ unless deterministic is True.
+# GPU). Everything random is derived from it, so a training is reproduced by
+# its seed:
+#   - the event shuffling, the train/val/test split and the oversampling
+#     (with the k-folding also the folds and, with a generator seeded by
+#     (seed, fold), the train/val split and oversampling of every fold);
+#   - the weight initialisation and the dropout (with the k-folding from an
+#     independent stream per fold, seeded with SeedSequence([seed, fold]));
+#   - a training resumed with --load-model continues exactly as if it had not
+#     been interrupted: the checkpoints store the states of the random
+#     generators, of the learning rate scheduler and of the early stopper.
+# On CPU two trainings with the same seed are identical; on GPU they can
+# slightly differ (non-deterministic cuDNN/cuBLAS kernels) unless
+# deterministic is True.
 seed: 100
 # Use only deterministic algorithms (torch.use_deterministic_algorithms and
 # cuDNN in deterministic mode), so that trainings with the same seed are

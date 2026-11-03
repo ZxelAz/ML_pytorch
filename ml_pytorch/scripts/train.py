@@ -27,11 +27,13 @@ from ml_pytorch.utils.lumitext import get_lumitext
 from ml_pytorch.utils.setup_logger import setup_logger
 from ml_pytorch.utils.tools import (
     eval_model,
+    add_training_state,
     export_onnx,
     kfold_weights_seed,
     resolve_input_variables,
     get_model_parameters_number,
     save_pytorch_model,
+    set_rng_state,
     set_seed,
     train_val_one_epoch,
 )
@@ -509,6 +511,25 @@ def main():
         best_ckpt = f"{main_dir}/state_dict/model_{best_epoch}_state_dict.pt"
         if cfg.load_model and os.path.exists(best_ckpt):
             best_model_name = best_ckpt
+        if cfg.load_model and "training_state" in checkpoint:
+            # continue exactly as the interrupted training: random generators,
+            # early stopper and exact best metrics of the loaded epoch
+            training_state = checkpoint["training_state"]
+            set_rng_state(training_state["rng"])
+            early_stopper.counter = training_state["early_stopper"]["counter"]
+            early_stopper.min_validation = training_state["early_stopper"]["min_validation"]
+            best_vloss = training_state["best_vloss"]
+            best_vaccuracy = training_state["best_vaccuracy"]
+            best_epoch = training_state["best_epoch"]
+            logger.info(
+                "Restored the random generators and the early stopper of epoch %d"
+                % loaded_epoch
+            )
+        elif cfg.load_model:
+            logger.warning(
+                "Checkpoint without the training state (older version): the "
+                "resumed training is not identical to an uninterrupted one"
+            )
         logger.info(
             "Loaded model from %s, epoch %d, best val loss: %.4f, best val accuracy: %.4f"
             % (best_model_name, loaded_epoch, best_vloss, best_vaccuracy)
@@ -609,6 +630,12 @@ def main():
             if early_stopping and early_stopper.early_stop(validator, epoch):
                 logger.info("Stopping early")
                 stop_training = True
+            if best_epoch == epoch:
+                # checkpoint saved at this epoch: add the state needed to resume
+                # from it reproducibly (random generators, early stopper)
+                add_training_state(
+                    best_model_name, early_stopper, best_vloss, best_vaccuracy, best_epoch
+                )
             if epoch == n_epochs - 1:
                 stop_training = True
 
@@ -619,12 +646,15 @@ def main():
             epoch += 1
 
         # save the last model
-        save_pytorch_model(
+        last_model_name = save_pytorch_model(
             main_dir,
             epoch,
             model,
             optimizer,
             scheduler=scheduler,
+        )
+        add_training_state(
+            last_model_name, early_stopper, best_vloss, best_vaccuracy, best_epoch
         )
         model.to("cpu")
 

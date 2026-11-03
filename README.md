@@ -171,7 +171,7 @@ A ready-to-edit multi-class example is provided at `configs/hh4b_sig_bkg_classif
 | `oversample_split`, `split_oversample`, `undersample` | binary-only class balancing strategies |
 | `eval`, `roc`, `histos`, `history`, `onnx` | toggle the post-training outputs |
 | `gpus` | comma-separated GPU indices, or unset for CPU |
-| `seed` | seed for both event shuffling and weight initialisation (python, numpy and torch, also on GPU) |
+| `seed` | seed of all the randomness (python, numpy and torch, also on GPU): event shuffling, splits, folds, oversampling, weight initialisation and dropout. Resumed trainings (`--load-model`) continue exactly as uninterrupted ones, since the checkpoints store the random generator, scheduler and early-stopper states. Bitwise identical on CPU; on GPU also needs `deterministic` |
 | `k_folds`, `fold`, `kfold_split`, `kfold_event_column`, `kfold_onnx`, `onnx_ratio`, `kfold_cache` | k-fold training, see [K-fold training](#k-fold-training) |
 | `deterministic` | use only deterministic algorithms, so that trainings with the same seed are identical also on GPU (slower) |
 | `pad_value` | value marking padded entries (missing objects); must match the PocketCoffea fill value. Used to pad the missing objects and the `None` values of the inputs when loading the dataset, to not count padded objects when creating a missing `<collection>_N` from parquet files and, in `MaskedBatchNorm1d`, to exclude padded entries from the normalisation statistics |

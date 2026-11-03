@@ -26,6 +26,49 @@ def kfold_weights_seed(seed, fold):
     return int(np.random.SeedSequence([int(seed), int(fold)]).generate_state(1)[0])
 
 
+def get_rng_state():
+    """States of the python, numpy and torch (CPU and GPU) random number
+    generators, in a form that torch.save / torch.load (weights_only) accept."""
+    np_state = np.random.get_state()
+    state = {
+        "python": random.getstate(),
+        "numpy": [np_state[0], torch.from_numpy(np_state[1].astype(np.int64)), *np_state[2:]],
+        "torch": torch.get_rng_state(),
+    }
+    if torch.cuda.is_available():
+        state["cuda"] = torch.cuda.get_rng_state_all()
+    return state
+
+
+def set_rng_state(state):
+    """Restore the random number generators saved with get_rng_state."""
+    random.setstate(state["python"])
+    name, key, *rest = state["numpy"]
+    np.random.set_state((name, key.numpy().astype(np.uint32), *rest))
+    torch.set_rng_state(state["torch"])
+    if "cuda" in state and torch.cuda.is_available():
+        torch.cuda.set_rng_state_all(state["cuda"])
+
+
+def add_training_state(checkpoint_name, early_stopper, best_vloss, best_vaccuracy, best_epoch):
+    """Add to a checkpoint the state needed to resume the training exactly as
+    if it had not been interrupted: the random number generators (dropout of
+    the next epochs), the early stopper and the exact best validation metrics
+    (the log only has them rounded)."""
+    checkpoint = torch.load(checkpoint_name)
+    checkpoint["training_state"] = {
+        "rng": get_rng_state(),
+        "early_stopper": {
+            "counter": early_stopper.counter,
+            "min_validation": float(early_stopper.min_validation),
+        },
+        "best_vloss": float(best_vloss),
+        "best_vaccuracy": float(best_vaccuracy),
+        "best_epoch": int(best_epoch),
+    }
+    torch.save(checkpoint, checkpoint_name)
+
+
 def set_seed(seed, deterministic=False):
     """Seed the python, numpy and torch (CPU and GPU) random number generators.
 
