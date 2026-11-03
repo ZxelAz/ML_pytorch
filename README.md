@@ -302,7 +302,10 @@ K-fold training (see K-fold training)
 Evaluation / output
   -ev, --eval                  Evaluate the model on the test set (no training)
   -em, --eval-model PATH       Path to an existing model to evaluate instead of training
-  -l,  --load-model PATH       Load a checkpoint and continue training from it
+  -l,  --load-model PATH       Load a checkpoint and continue training from it (model,
+                                optimizer and learning rate scheduler state; for older
+                                checkpoints without the scheduler state the schedule is
+                                continued from the checkpoint epoch)
   -mp, --ml-model-path PATH    Path to the ML_model.py file used with --load-model/--eval-model
                                 (default: <output_dir>/ML_model.py)
   --onnx                       Export the best model to ONNX format after training

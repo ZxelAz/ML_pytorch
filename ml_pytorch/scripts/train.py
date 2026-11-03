@@ -456,6 +456,19 @@ def main():
         model.load_state_dict(checkpoint["state_dict"])
         optimizer.load_state_dict(checkpoint["optimizer"])
         loaded_epoch = checkpoint["epoch"]
+        # restore the learning rate scheduler, so that the schedule continues
+        # from the loaded epoch instead of restarting from epoch 0
+        if "scheduler" in checkpoint:
+            scheduler.load_state_dict(checkpoint["scheduler"])
+        else:
+            # older checkpoints without the scheduler state: the checkpoint is
+            # saved after the scheduler step of the epoch, so the scheduler is
+            # at loaded_epoch + 1 (the optimizer lr is already restored)
+            scheduler.last_epoch = loaded_epoch + 1
+        logger.info(
+            "Learning rate scheduler at epoch %d, learning rate: %.3e"
+            % (scheduler.last_epoch, optimizer.param_groups[0]["lr"])
+        )
         best_model_name = cfg.load_model if cfg.load_model else cfg.eval_model
 
         with open(logger_file, "r") as f:
@@ -467,6 +480,11 @@ def main():
                     best_vloss = float(line.split(",")[1].split(":")[1])
                     best_vaccuracy = float(line.split(",")[2].split(":")[1])
                     break
+        # when resuming, the best model is the checkpoint of the best epoch,
+        # not the loaded (latest) one
+        best_ckpt = f"{main_dir}/state_dict/model_{best_epoch}_state_dict.pt"
+        if cfg.load_model and os.path.exists(best_ckpt):
+            best_model_name = best_ckpt
         logger.info(
             "Loaded model from %s, epoch %d, best val loss: %.4f, best val accuracy: %.4f"
             % (best_model_name, loaded_epoch, best_vloss, best_vaccuracy)
@@ -517,7 +535,7 @@ def main():
                 optimizer,
                 device,
                 time_epoch,
-                None,
+                scheduler,  # not stepped in validation, saved in the checkpoint
                 cfg,
                 main_dir,
                 best_vloss,
@@ -582,6 +600,7 @@ def main():
             epoch,
             model,
             optimizer,
+            scheduler=scheduler,
         )
         model.to("cpu")
 

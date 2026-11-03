@@ -226,7 +226,9 @@ def loop_one_batch(
     )
 
 
-def save_pytorch_model(main_dir, epoch_index, model, optimizer, save_model=False):
+def save_pytorch_model(
+    main_dir, epoch_index, model, optimizer, save_model=False, scheduler=None
+):
     model_dir = f"{main_dir}/models"
     state_dict_dir = f"{main_dir}/state_dict"
     save_model=False
@@ -242,6 +244,10 @@ def save_pytorch_model(main_dir, epoch_index, model, optimizer, save_model=False
         "state_dict": model.state_dict(),
         "optimizer": optimizer.state_dict(),
     }
+    # the state of the learning rate scheduler, to continue the schedule when
+    # resuming the training with --load-model
+    if scheduler is not None:
+        checkpoint["scheduler"] = scheduler.state_dict()
     torch.save(checkpoint, state_dict_name)
     logger.info(f"Saved state_dict at epoch {epoch_index} to {state_dict_name}")
     return state_dict_name
@@ -349,7 +355,9 @@ def train_val_one_epoch(
         best_loss = avg_loss
         best_accuracy = avg_accuracy
         best_epoch = epoch_index
-        best_model_name = save_pytorch_model(main_dir, epoch_index, model, optimizer, cfg.save_model)
+        best_model_name = save_pytorch_model(
+            main_dir, epoch_index, model, optimizer, cfg.save_model, scheduler
+        )
 
     return (
         avg_loss,
