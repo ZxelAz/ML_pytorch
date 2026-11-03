@@ -319,3 +319,45 @@ def _sum(tensors):
     for t in tensors[1:]:
         s = op.add(s, t)
     return s
+
+
+def build_multiclass_morphing_models(
+    onnx_models, n_features, alpha, alpha_den, event_split=False
+):
+    """Build the QCD-morphing weight models of the 4-node multiclass k-fold
+    models ``onnx_models`` (ordered by fold), with the ttbar subtraction of
+    get_multiclass_ratio_model_tensor_onnx.
+
+    Returns a dict {name: onnx model} with:
+      - ``average_morphing``: as ml_onnx -ar -mc, the raw numerators
+        r_0 - alpha * r_2 and denominators r_1 - alpha_den * r_3 are averaged
+        over the folds before the relu and the division (input ``args_0``,
+        output ``avg_w``)
+      - ``event_morphing`` (event_split=True): inputs ``args_0`` and
+        ``event``, the weight of the fold ``event % k_folds`` (output ``w``)
+    """
+    k_folds = len(onnx_models)
+    b = argument(Tensor(np.float32, ("N", n_features)))
+    num_den = [
+        get_multiclass_num_den_tensor_onnx(m, b, alpha, alpha_den) for m in onnx_models
+    ]
+    avg_num = op.div(_sum([n for n, _ in num_den]), op.const(np.float32(k_folds)))
+    avg_den = op.div(_sum([d for _, d in num_den]), op.const(np.float32(k_folds)))
+    avg_num = op.relu(avg_num)
+    if alpha_den:
+        avg_den = op.relu(avg_den)
+    avg_den = op.add(avg_den, op.const(np.float32(RATIO_DEN_EPS)))
+    models = {
+        "average_morphing": build({"args_0": b}, {"avg_w": op.div(avg_num, avg_den)})
+    }
+    if event_split:
+        event = argument(Tensor(np.int64, ("N",)))
+        ratios = [
+            get_multiclass_ratio_model_tensor_onnx(m, b, alpha, alpha_den)
+            for m in onnx_models
+        ]
+        models["event_morphing"] = build(
+            {"args_0": b, "event": event},
+            {"w": _select_per_fold(ratios, event, k_folds)},
+        )
+    return models

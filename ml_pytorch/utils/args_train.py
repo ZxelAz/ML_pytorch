@@ -231,6 +231,12 @@ parser.add_argument(
     type=str,
 )
 parser.add_argument(
+    "--kfold-split-dir",
+    default=None,
+    help="K-fold: directory where the record of the split (k.npy and metadata) is saved when preparing the cache",
+    type=str,
+)
+parser.add_argument(
     "--kfold-prepare",
     default=None,
     help="K-fold: only load the events and save them in the --kfold-cache directory",

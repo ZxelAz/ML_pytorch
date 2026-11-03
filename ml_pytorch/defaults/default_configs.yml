@@ -132,6 +132,17 @@ onnx_ratio: False
 #            never seen in the training can be evaluated with any fold.
 #            Needs kfold_split: event.
 kfold_onnx: average
+# K-fold, 4-node multiclass morphing (classes data num., data den., ttbar
+# num., ttbar den., see the README): ttbar fraction alpha = N_ttbar / N_data of
+# the numerator region and of the denominator region (computed by ml_alpha,
+# or automatically by jobs/run_training.sh --alpha). If morphing_alpha is set,
+# the final k-fold ONNX model is the morphing weight
+#   w = relu(r_0 - alpha * r_2) / relu(r_1 - alpha_den * r_3)
+# (averaged over the folds as ml_onnx -ar -mc does, or of the fold of the
+# event with kfold_onnx: event). morphing_alpha_den 0.0 switches off the ttbar
+# subtraction in the denominator.
+morphing_alpha: null
+morphing_alpha_den: 0.0
 # Directory of the k-fold cache. If set, the events are loaded, shuffled and
 # assigned to the folds only once (ml_train --kfold-prepare, done
 # automatically when training all the folds with ml_train or
@@ -140,7 +151,15 @@ kfold_onnx: average
 # folds run in parallel, and each fold keeps only the indices of its events.
 # The cache is reused if it was made with the same data, fractions,
 # oversampling, seed, k_folds and kfold_split, otherwise ml_train stops.
+# ml_train -k K and jobs/run_training.sh --k-folds put the cache in a
+# temporary directory ($TMPDIR, node-local on the batch nodes), removed at the
+# end, so the large arrays are not written to the output disk.
 kfold_cache: null
+# Directory where the record of the split is saved when the cache is
+# prepared: k.npy ([kl, dataset index, fold] of every event, in the shuffled
+# order) and the metadata, for reproducibility. ml_train -k K and
+# jobs/run_training.sh use <output dir>/kfold_split.
+kfold_split_dir: null
 # Only prepare the k-fold cache (see kfold_cache) and exit.
 kfold_prepare: False
 

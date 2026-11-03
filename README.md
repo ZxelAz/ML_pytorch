@@ -393,22 +393,32 @@ All the folds use the same `seed`. `--load-model`/`--eval-model` work for one fo
 
 **K-fold cache.** With `kfold_cache: <dir>` (`--kfold-cache`), the events are loaded, shuffled and assigned to the folds only once (`ml_train --kfold-prepare`). They are saved in `<dir>` as `.npy` files, and every fold memory-maps them. The pages of a memory-mapped file are shared by all the processes of a node, so the events take the RAM once however many folds run in parallel. Each fold only holds the indices of its training, validation and test events; oversampling repeats indices, not events.
 
-`ml_train -k K` and `run_training.sh --k-folds K` use the cache automatically, in `<output dir>/kfold_cache` (`--no-kfold-cache` to disable it in the script). A cache is reused only if it was made with the same data, fractions, oversampling, seed, `k_folds` and `kfold_split`; otherwise `ml_train` stops. The batches are exactly the same as without the cache.
+`ml_train -k K` and `run_training.sh --k-folds K` use the cache automatically (`--no-kfold-cache` to disable it in the script).
+* **Where it lives:** in a temporary directory (`$TMPDIR`, node-local on the batch nodes). It is not written to the output disk, and it is removed when the training ends. In `run_training.sh` every job or array task prepares its own cache on its node.
+* **What is kept in the output directory:** only the record of the split in `<output dir>/kfold_split/`, which holds `k.npy` (kl, dataset index and fold of every event) and the metadata. This is for reproducibility.
+* **Reuse:** a cache given with `kfold_cache` is reused only if it was made with the same data, fractions, oversampling, seed, `k_folds` and `kfold_split`; otherwise `ml_train` stops. The batches are exactly the same as without the cache.
 
-**Checks of the split.** The merge checks two things:
+**Out-of-fold scores without files.** The fold trainings don't save any score arrays. The merge evaluates the best ONNX model of every fold on its test events in memory, using the cache if it still exists or loading the events again into a temporary directory. It does the same on a random 1/(K-1) of each fold's training events, for the train/test comparison in the plots.
+
+With `-s-n/--save-numpy` all the scores are saved: `fold_<k>/score_lbl_array.npz` by every fold, and `kfold/score_lbl_array_oof.npz` by the merge. Without it, none are written.
+
+**Checks of the split.** The merge stops with an error if any of these fails:
 * every fold directory is the right fold of the same split (same data, fractions, oversampling, seed, `k_folds` and `kfold_split`);
+* every fold was trained with the test events expected from the split. Each fold writes the number and a sha256 fingerprint of its test events to `fold_<k>/kfold_fold_info.json`;
 * the test folds are disjoint and together contain every event exactly once.
 
-Each fold saves the rows of its test events for this check, as `event_rows_test` in `score_lbl_array.npz`. The weight initialisation is different for every fold (seed `seed * K + fold`).
+The weight initialisation is different for every fold (seed `seed * K + fold`).
 
 ### Outputs
 
-* `fold_<k>/`: a normal training output for each fold, including `score_lbl_array.npz`. Here the test scores are the scores of the events of fold `k`, with no event dropped.
+* `fold_<k>/`: a normal training output for each fold, plus `kfold_fold_info.json`. The test scores (plots, and `score_lbl_array.npz` with `--save-numpy`) are the scores of the events of fold `k`, with no event dropped.
+* `kfold_split/`: the record of the split (`k.npy` and the metadata).
 * `kfold/kfold_summary.yml`: best epoch and validation/test loss and accuracy of each fold, with their mean and standard deviation.
-* `kfold/score_lbl_array_oof.npz`: the out-of-fold scores of all the events (`score_lbl_array_test`, plus `fold_test` with the fold of each event), and the training scores of all the folds. The histograms and ROC curves of these scores are saved in `kfold/`.
+* `kfold/`: the histograms, ROC and calibration curves of the out-of-fold scores of all the events. With `--save-numpy` it also holds `score_lbl_array_oof.npz`, which contains `score_lbl_array_test`, `fold_test` (the fold of each event) and the training scores.
 * `kfold_onnx/folds/model_fold<k>.onnx`: the best model of each fold.
 * `kfold_onnx/average_model_kfold.onnx`: the average of the outputs of the K models (input `args_0`, output `avg_score`). Use it for events that were not used in the training.
-* `kfold_onnx/average_ratio_model_kfold.onnx` (`onnx_ratio: True` or `--ratio`): the average over the folds of the ratio of the outputs (`p/(1-p)` for one output node, `p1/p0` for two), output `avg_w`, for the background reweighting. Equivalent to `ml_onnx -ar` on the fold models. For the 4-node multiclass morphing, use `ml_onnx -ar -mc -i kfold_onnx/folds` instead.
+* `kfold_onnx/average_ratio_model_kfold.onnx` (`onnx_ratio: True` or `--ratio`): the average over the folds of the ratio of the outputs (`p/(1-p)` for one output node, `p1/p0` for two), output `avg_w`, for the background reweighting. Equivalent to `ml_onnx -ar` on the fold models.
+* `kfold_onnx/average_morphing_model_kfold.onnx` (and `event_fold_morphing_model_kfold.onnx` with `kfold_split: event`): for the 4-node multiclass morphing, when `morphing_alpha` (`ml_kfold_merge --alpha`) is given. It is the morphing weight with the ttbar subtraction, the same as `ml_onnx -ar -mc` on the fold models, and it becomes the final model; see [Boosted HH4b: multiclass background morphing](#boosted-hh4b-multiclass-background-morphing).
 * `kfold_onnx/event_fold_model_kfold.onnx` (and `event_fold_ratio_model_kfold.onnx` with the ratio), only with `kfold_split: event`. It takes two inputs: `args_0`, the input variables `(N, n_features)` float32, and `event`, the event number `(N,)` int64. Each event is evaluated with the model of fold `event % K`, which is the model that was **not** trained on it. Use it for the events that were used in the training (e.g. the training regions).
 * `kfold_onnx/final_model_kfold.onnx`: a copy of the combined model chosen with `kfold_onnx`. Its ratio variant is used when `onnx_ratio` is set. The choice is also written in `kfold/kfold_summary.yml` (`final_onnx`).
   * `kfold_onnx: average` (default) gives the average over the folds. Use it when the model is applied to events that were not used in the training, e.g. the background reweighting applied in a separate region.
@@ -623,6 +633,24 @@ boosted_control_sideband_region_A 545355      60568.0    0.1111    0.0002
 The value needed is the `alpha` of the numerator region: region C for the TXbb direction (here `0.1078`),
 region B for the mass direction.
 
+`ml_alpha -c <config>` reads the directory and the regions from the training config. The directory is the first
+`data_dirs`; the numerator and denominator are the regions of the classes with `lbl` 0 and 1. It prints the table
+and the two alphas, and `--json <file>` saves them.
+
+**Automatically with `run_training.sh`.** With `--alpha`, the post-processing computes alpha with `ml_alpha` (saved
+in `<outdir>/alpha.json`) and passes it to the conversion:
+* `ml_onnx -ar -mc -al <alpha> -ald <alpha_den>` for the trainings with several seeds;
+* `ml_kfold_merge --alpha <alpha> --alpha-den <alpha_den>` with `--k-folds`. The final model,
+  `kfold_onnx/final_model_kfold.onnx`, is then the morphing weight averaged over the folds.
+
+`alpha_den` is `0.0` (no ttbar subtraction in the denominator) unless `--alpha-den-computed` is given; then the
+computed alpha of the denominator region is used.
+
+```bash
+./run_training.sh -c /full/path/boosted_vbf/<config>.yml -o /full/path/out -n 20 -p 4 --alpha
+./run_training.sh -c /full/path/boosted_vbf/<config>.yml -o /full/path/out -k 20 -g 8 --cpus 40 --alpha
+```
+
 ### Merge the 20 models with the ttbar subtraction
 
 Run `ml_onnx` in multiclass mode inside the `best_models` folder of the training output:
@@ -683,6 +711,7 @@ Each training run writes to `${output_dir}` (default `/work/$USER/out_ML_pytorch
   * `score_lbl_array_train`, `score_lbl_array_test`: `[scores..., label, weight, kl]` per event. For binary the score block is a single column, for multi-class it has `num_classes` columns.
   * `train_test_fractions`, `num_classes`, `class_info` (list of `{name, lbl, class_idx}` dicts).
 * Plots: `sig_bkg_distributions_*`, `roc_curve_*`, training history, etc.
+* Calibration curves (`calibration_bkgkl_*/`): they are computed on class-normalised histograms. The event weights of each class are scaled to unit area, so the curves don't depend on the relative number of events of the classes in the test dataset, and a classifier trained on balanced classes lies on the diagonal when it is well calibrated. Each class is normalised for one-vs-rest, and the two classes of the pair for the pairwise curves. The Brier score uses the same weights. `sklearn.calibration.calibration_curve` has no event weights, so a weighted histogram is used instead.
 
 ## Additional scripts
 

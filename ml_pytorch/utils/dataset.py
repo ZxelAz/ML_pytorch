@@ -1651,15 +1651,41 @@ def save_kfold_cache(cache_dir, arrays, meta, cfg):
         json.dump(meta, f, indent=2)
     logger.info(f"Saved the k-fold cache of {meta['n_events']} events in {cache_dir}")
 
+    # record of the split ([kl, dataset_idx, fold] of every event and the
+    # metadata), kept for reproducibility when the cache itself is in tmp
+    split_dir = cfg.get("kfold_split_dir", None)
+    if split_dir:
+        os.makedirs(split_dir, exist_ok=True)
+        np.save(os.path.join(split_dir, "k.npy"), np.asarray(arrays["k"]))
+        with open(os.path.join(split_dir, KFOLD_CACHE_META), "w") as f:
+            json.dump(meta, f, indent=2)
+        logger.info(f"Saved the record of the k-fold split in {split_dir}")
 
-def load_data_from_kfold_cache(cfg, seed):
-    cache_dir = cfg.kfold_cache
+
+def kfold_test_info(test_idx, n_events):
+    """Number and fingerprint of the test events of a fold, to check in the
+    merge that the folds were trained with the expected split."""
+    rows = np.sort(np.asarray(test_idx, dtype=np.int64))
+    return {
+        "n_events_total": int(n_events),
+        "n_test": int(len(rows)),
+        "test_rows_sha256": hashlib.sha256(rows.tobytes()).hexdigest(),
+    }
+
+
+def open_kfold_cache(cache_dir, cfg):
+    """Memory-mapped arrays and metadata of the k-fold cache."""
     meta = check_kfold_cache(cache_dir, cfg)
     logger.info(f"Reading the events from the k-fold cache {cache_dir}")
     arrays = {
         name: np.load(os.path.join(cache_dir, f"{name}.npy"), mmap_mode="r")
         for name in KFOLD_CACHE_ARRAYS
     }
+    return arrays, meta
+
+
+def load_data_from_kfold_cache(cfg, seed):
+    arrays, meta = open_kfold_cache(cfg.kfold_cache, cfg)
     return make_kfold_loaders(cfg, arrays, meta, seed)
 
 

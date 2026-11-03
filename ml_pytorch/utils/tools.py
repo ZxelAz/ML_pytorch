@@ -1,3 +1,4 @@
+import importlib
 import torch
 import numpy as np
 import os
@@ -369,6 +370,48 @@ def train_val_one_epoch(
     )
 
 
+def scores_to_probabilities(all_scores):
+    """Scores of the events in the layout of the score_lbl arrays: one column
+    with the signal probability for binary models (1 or 2 output nodes), one
+    column per class for multi-class models, in [0, 1] whatever the model
+    architecture."""
+    all_scores = torch.as_tensor(all_scores)
+    # the outputs of single-node models are flattened in loop_one_batch
+    if all_scores.dim() == 1:
+        all_scores = all_scores.view(-1, 1)
+
+    # Normalize raw logits into probabilities so that the saved scores live
+    # in [0, 1] regardless of the model architecture.
+    if torch.any(all_scores < 0) or torch.any(all_scores > 1):
+        if all_scores.shape[1] == 1:
+            all_scores = torch.nn.functional.sigmoid(all_scores)
+        else:
+            all_scores = torch.nn.functional.softmax(all_scores, dim=1)
+
+    # For backward compatibility with the binary sig/bkg case (1 or 2 output
+    # nodes) we collapse to a single column containing the signal probability.
+    # For genuine multi-class outputs (>=3) we keep all class probabilities.
+    if all_scores.shape[1] == 2:
+        all_scores = all_scores[:, -1].view(-1, 1)
+    elif all_scores.shape[1] == 1:
+        all_scores = all_scores.view(-1, 1)
+    return all_scores
+
+
+def resolve_input_variables(cfg):
+    """Convert the name of an input variables module (cfg.input_variables)
+    into the list of columns."""
+    if isinstance(cfg.input_variables, str):
+        logger.info("Get Input variables from dnn_inputs")
+        logger.info(cfg.input_variables)
+        dnn_input_variables_file = importlib.import_module(
+            f"ml_pytorch.defaults.{cfg.input_variables}"
+        )
+        cfg.input_variables = create_DNN_columns_list(
+            cfg.run2, dnn_input_variables_file.dnn_input_variables
+        )
+
+
 def eval_model(model, loader, loss_fn, type_eval, device, best_epoch):
     # Test the model by running it on the test set
     running_loss = 0.0
@@ -435,25 +478,7 @@ def eval_model(model, loader, loss_fn, type_eval, device, best_epoch):
     all_weights = torch.cat(all_weights).cpu()
     all_kl_values = torch.cat(all_kl_values).cpu()
 
-    # the outputs of single-node models are flattened in loop_one_batch
-    if all_scores.dim() == 1:
-        all_scores = all_scores.view(-1, 1)
-
-    # Normalize raw logits into probabilities so that the saved scores live
-    # in [0, 1] regardless of the model architecture.
-    if torch.any(all_scores < 0) or torch.any(all_scores > 1):
-        if all_scores.shape[1] == 1:
-            all_scores = torch.nn.functional.sigmoid(all_scores)
-        else:
-            all_scores = torch.nn.functional.softmax(all_scores, dim=1)
-
-    # For backward compatibility with the binary sig/bkg case (1 or 2 output
-    # nodes) we collapse to a single column containing the signal probability.
-    # For genuine multi-class outputs (>=3) we keep all class probabilities.
-    if all_scores.shape[1] == 2:
-        all_scores = all_scores[:, -1].view(-1, 1)
-    elif all_scores.shape[1] == 1:
-        all_scores = all_scores.view(-1, 1)
+    all_scores = scores_to_probabilities(all_scores)
 
     all_labels = all_labels.view(-1, 1)
     all_weights = all_weights.view(-1, 1)

@@ -25,7 +25,12 @@
 #   -k, --k-folds INT       K-fold training: train the K folds (one job each,
 #                           same seed) and merge them with ml_kfold_merge
 #   --no-kfold-cache        K-fold: every fold loads the events itself, instead
-#                           of loading them once in OUTDIR/kfold_cache
+#                           of loading them once in a temporary cache
+#   --alpha                 Boosted multiclass morphing: compute the ttbar
+#                           fraction alpha with ml_alpha and use it in the ONNX
+#                           conversion (ttbar subtraction)
+#   --alpha-den-computed    Use also the computed alpha of the denominator
+#                           region (default: alpha_den 0.0)
 #   --load-last             Resume from latest checkpoint instead of restarting
 #   --time HH:MM:SS         Slurm wall-clock time limit (default: 8:30:00)
 #   --mem-per-cpu MB        Slurm memory per CPU in MB (default: 4000)
@@ -43,6 +48,8 @@ INIT_SEED=0
 RATIO=false
 K_FOLDS=0
 KFOLD_CACHE=true
+ALPHA=false
+ALPHA_DEN_COMPUTED=false
 LOAD_LAST=false
 MODE="train"
 NO_SLURM=false
@@ -74,6 +81,14 @@ Optional:
                           events are loaded once in OUTDIR/kfold_cache and
                           memory-mapped by all the folds
   --no-kfold-cache        K-fold: every fold loads the events itself
+  --alpha                 Boosted 4-node multiclass morphing: compute the ttbar
+                          fraction alpha = N_ttbar / N_data with ml_alpha (from
+                          the data_dirs and the regions of the config, saved
+                          in OUTDIR/alpha.json) and pass it to ml_onnx -mc
+                          (or ml_kfold_merge) for the ttbar subtraction
+  --alpha-den-computed    With --alpha: use also the computed alpha of the
+                          denominator region (default alpha_den 0.0, i.e. no
+                          ttbar subtraction in the denominator)
   --load-last             Resume from latest checkpoint
   --time HH:MM:SS         Slurm wall-clock time limit (default: 8:30:00)
   --mem-per-cpu MB        Slurm memory per CPU in MB (default: 4000)
@@ -116,6 +131,8 @@ while [[ $# -gt 0 ]]; do
         --ratio)           RATIO=true; shift ;;
         -k|--k-folds)      K_FOLDS="$2"; shift 2 ;;
         --no-kfold-cache)  KFOLD_CACHE=false; shift ;;
+        --alpha)           ALPHA=true; shift ;;
+        --alpha-den-computed) ALPHA_DEN_COMPUTED=true; shift ;;
         --load-last)       LOAD_LAST=true; shift ;;
         --time)            SLURM_TIME="$2"; shift 2 ;;
         --mem-per-cpu)     SLURM_MEM="$2"; shift 2 ;;
@@ -162,7 +179,12 @@ TRAININGS_PER_NODE=$(( (N_TRAININGS + NODES - 1) / NODES ))
 # K-fold cache: the events are loaded once and memory-mapped by all the folds
 USE_KFOLD_CACHE=false
 [[ "$K_FOLDS" -ge 2 && "$KFOLD_CACHE" == true ]] && USE_KFOLD_CACHE=true
-KFOLD_CACHE_DIR="${OUT_DIR}/kfold_cache"
+# The cache holds a copy of all the events: it is written to the node-local
+# temporary directory of each job (one per array task), not to OUT_DIR, and
+# removed when the job ends. Only the record of the split (k.npy and the
+# metadata) is kept, in OUT_DIR/kfold_split.
+KFOLD_CACHE_DIR="${TMPDIR:-/tmp}/ml_kfold_cache_${SLURM_JOB_ID:-$$}${SLURM_ARRAY_TASK_ID:+_${SLURM_ARRAY_TASK_ID}}"
+KFOLD_SPLIT_DIR="${OUT_DIR}/kfold_split"
 
 
 # ─── Helper: canonical run directory for a given seed ────────────────────────
@@ -195,6 +217,8 @@ build_submit_args() {
     [[ "$RATIO"     == true ]] && args+=(--ratio)
     [[ "$LOAD_LAST" == true ]] && args+=(--load-last)
     [[ "$KFOLD_CACHE" != true ]] && args+=(--no-kfold-cache)
+    [[ "$ALPHA" == true ]] && args+=(--alpha)
+    [[ "$ALPHA_DEN_COMPUTED" == true ]] && args+=(--alpha-den-computed)
     [[ ${#EXTRA_ARGS[@]} -gt 0 ]] && args+=(-- "${EXTRA_ARGS[@]}")
     printf '%s\0' "${args[@]}"
 }
@@ -230,24 +254,10 @@ if [[ -z "${SLURM_JOB_ID:-}" && "$NO_SLURM" != true ]]; then
     else
         # Array job per node + dependent postproc job
         ARRAY_MAX=$(( NODES - 1 ))
-        PREPARE_DEPENDENCY=()
-        if [[ "$USE_KFOLD_CACHE" == true ]]; then
-            # the k-fold cache is prepared once, before the array tasks
-            mapfile -d '' PREPARE_ARGS < <(build_submit_args prepare)
-            PREPARE_JOB_ID=$(sbatch --parsable \
-                --job-name="ml_kfold_cache" \
-                --output="${SLURM_LOG_DIR}/slurm-%j.out" \
-                --gres="gpu:1" \
-                "${SBATCH_RESOURCES[@]}" \
-                "$SCRIPT_PATH" "${PREPARE_ARGS[@]}")
-            echo "  K-fold cache job submitted: ${PREPARE_JOB_ID}"
-            PREPARE_DEPENDENCY=(--dependency="afterok:${PREPARE_JOB_ID}")
-        fi
         mapfile -d '' TRAIN_ARGS < <(build_submit_args train)
         echo "Submitting array job: ${NODES} nodes × ${TRAININGS_PER_NODE} trainings on ${GPUS_PER_NODE} GPU(s) each (total: ${N_TRAININGS})..."
         TRAIN_JOB_ID=$(sbatch --parsable \
             --job-name="ml_train_array" \
-            "${PREPARE_DEPENDENCY[@]}" \
             --array="0-${ARRAY_MAX}" \
             --output="${SLURM_LOG_DIR}/slurm-%A_%a.out" \
             --gres="gpu:${GPUS_PER_NODE}" \
@@ -352,21 +362,39 @@ run_prepare() {
     export MKL_NUM_THREADS="$OMP_NUM_THREADS"
     local prepare_args=(
         -c "$CONFIG_FILE" -s "$INIT_SEED" --k-folds "$K_FOLDS"
-        --kfold-cache "$KFOLD_CACHE_DIR" --kfold-prepare
+        --kfold-cache "$KFOLD_CACHE_DIR" --kfold-split-dir "$KFOLD_SPLIT_DIR"
+        --kfold-prepare
     )
     [[ ${#EXTRA_ARGS[@]} -gt 0 ]] && prepare_args+=("${EXTRA_ARGS[@]}")
     echo "Preparing the k-fold cache in ${KFOLD_CACHE_DIR}..."
+    # remove the cache when the job ends, also if it fails
+    trap 'echo "Removing the k-fold cache ${KFOLD_CACHE_DIR}"; rm -rf "${KFOLD_CACHE_DIR}"' EXIT
     ml_train "${prepare_args[@]}" || { echo "Error: k-fold cache preparation failed"; exit 1; }
 }
 
 # ─── Post-processing: collect best models + ONNX aggregation ──────────────────
+# ─── Boosted morphing: ttbar fraction alpha from the PocketCoffea outputs ─────
+compute_alpha() {
+    local values
+    values=$(ml_alpha -c "$CONFIG_FILE" --print --json "${OUT_DIR}/alpha.json") \
+        || { echo "Error: ml_alpha failed"; exit 1; }
+    read -r ALPHA_NUM ALPHA_DEN_VALUE <<< "$values"
+    [[ "$ALPHA_DEN_COMPUTED" != true ]] && ALPHA_DEN_VALUE=0.0
+    echo "ttbar fraction: alpha ${ALPHA_NUM}, alpha_den ${ALPHA_DEN_VALUE} (table in ${OUT_DIR}/alpha.json)"
+}
+
 run_postproc() {
+    [[ "$ALPHA" == true ]] && compute_alpha
     if [[ "$K_FOLDS" -ge 2 ]]; then
         # out-of-fold scores, summary of the folds and combined ONNX models
         # the config of the folds is read from OUT_DIR/fold_0, with the ml_train
         # options used for the trainings
         local merge_args=(-i "$OUT_DIR" -k "$K_FOLDS")
         [[ "$RATIO" == true ]] && merge_args+=(--ratio)
+        [[ "$ALPHA" == true ]] && merge_args+=(--alpha "$ALPHA_NUM" --alpha-den "$ALPHA_DEN_VALUE")
+        # the cache of this job, if the merge runs in it (otherwise the merge
+        # loads the events again into a temporary directory)
+        [[ "$USE_KFOLD_CACHE" == true && -d "$KFOLD_CACHE_DIR" ]] && merge_args+=(--kfold-cache "$KFOLD_CACHE_DIR")
         echo "Merging the ${K_FOLDS} folds in ${OUT_DIR}..."
         ml_kfold_merge "${merge_args[@]}"
         return
@@ -397,6 +425,8 @@ run_postproc() {
 
     local onnx_args=(-i best_models -o best_models)
     [[ "$RATIO" == true ]] && onnx_args+=(-ar)
+    # multiclass morphing with the ttbar subtraction (average of the ratios)
+    [[ "$ALPHA" == true ]] && onnx_args+=(-ar -mc -al "$ALPHA_NUM" -ald "$ALPHA_DEN_VALUE")
 
     ml_onnx "${onnx_args[@]}" --config "$CONFIG_FILE"
 }
@@ -430,9 +460,9 @@ case "$MODE" in
 
         N_NODE_TRAININGS=$(( NODE_END - NODE_START + 1 ))
 
-        # single job: prepare the k-fold cache before starting the folds (with
-        # several array tasks it is prepared by a separate job before them)
-        [[ "$USE_KFOLD_CACHE" == true && "$NODES" -eq 1 ]] && run_prepare
+        # prepare the k-fold cache in the temporary directory of this job before
+        # starting its folds (every array task prepares its own, on its node)
+        [[ "$USE_KFOLD_CACHE" == true ]] && run_prepare
 
         # GPUs actually visible to this job (Slurm sets CUDA_VISIBLE_DEVICES
         # to the allocated ones, which are then numbered 0..N-1)
@@ -467,10 +497,6 @@ case "$MODE" in
         if [[ "$N_TRAININGS" -gt 1 && "$NODES" -eq 1 ]]; then
             run_postproc
         fi
-        ;;
-
-    prepare)
-        run_prepare
         ;;
 
     postproc)

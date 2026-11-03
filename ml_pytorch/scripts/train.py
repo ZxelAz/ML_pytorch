@@ -1,10 +1,12 @@
 import datetime
 import importlib
-import logging
 import importlib.util
+import json
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
 
 import numpy as np
@@ -16,6 +18,7 @@ from ml_pytorch.utils.args_train import args
 # from torch.utils.tensorboard import SummaryWriter
 from ml_pytorch.utils.dataset import (
     check_kfold_onnx_cfg,
+    kfold_test_info,
     load_data,
     loaders_to_device,
 )
@@ -23,9 +26,9 @@ from ml_pytorch.utils.early_stopper import EarlyStopper
 from ml_pytorch.utils.lumitext import get_lumitext
 from ml_pytorch.utils.setup_logger import setup_logger
 from ml_pytorch.utils.tools import (
-    create_DNN_columns_list,
     eval_model,
     export_onnx,
+    resolve_input_variables,
     get_model_parameters_number,
     save_pytorch_model,
     set_seed,
@@ -58,21 +61,6 @@ def make_output_dir(main_dir, overwrite):
             else:
                 print("Exiting...")
                 sys.exit(0)
-
-
-def resolve_input_variables(cfg):
-    """Convert the name of an input variables module into the list of columns."""
-    if isinstance(cfg.input_variables, str):
-        logger = logging.getLogger()
-        logger.info("Get Input variables from dnn_inputs")
-        logger.info(cfg.input_variables)
-        dnn_input_variables_file = importlib.import_module(
-            f"ml_pytorch.defaults.{cfg.input_variables}"
-        )
-
-        cfg.input_variables = create_DNN_columns_list(
-            cfg.run2, dnn_input_variables_file.dnn_input_variables
-        )
 
 
 def prepare_kfold_cache(cfg):
@@ -108,13 +96,35 @@ def run_all_folds(cfg, main_dir):
     make_output_dir(main_dir, cfg.overwrite)
     setup_logger(f"{main_dir}/logger_kfold.log", cfg.verbosity)
     os.system(f"cp {args.config} {main_dir}")
-    # the events are loaded only once, in the k-fold cache
-    cache_dir = cfg.kfold_cache or f"{main_dir}/kfold_cache"
+    # the events are loaded only once, in the k-fold cache, which by default
+    # is a temporary directory (not to fill the output disk), removed at the
+    # end; only the record of the split is kept in the output directory
+    temp_cache = not cfg.kfold_cache
+    cache_dir = cfg.kfold_cache or tempfile.mkdtemp(
+        prefix="ml_kfold_cache_", dir=os.environ.get("TMPDIR")
+    )
+    split_dir = cfg.kfold_split_dir or f"{main_dir}/kfold_split"
     cfg.kfold_cache = cache_dir
+    cfg.kfold_split_dir = split_dir
     OmegaConf.save(cfg, f"{main_dir}/config_parameters.yml")
+    try:
+        run_folds(cfg, main_dir, cache_dir, split_dir)
+        merge_kfold(main_dir, cfg)
+    finally:
+        if temp_cache:
+            print(f"Removing the k-fold cache {cache_dir}")
+            shutil.rmtree(cache_dir, ignore_errors=True)
 
+
+def run_folds(cfg, main_dir, cache_dir, split_dir):
     cmd = kfold_subprocess_cmd(
-        "--k-folds", str(cfg.k_folds), "--kfold-cache", cache_dir, "--kfold-prepare"
+        "--k-folds",
+        str(cfg.k_folds),
+        "--kfold-cache",
+        cache_dir,
+        "--kfold-split-dir",
+        split_dir,
+        "--kfold-prepare",
     )
     print(" ".join(cmd))
     subprocess.run(cmd, check=True)
@@ -135,8 +145,6 @@ def run_all_folds(cfg, main_dir):
         )
         print(" ".join(cmd))
         subprocess.run(cmd, check=True)
-
-    merge_kfold(main_dir, cfg)
 
 
 def main():
@@ -212,9 +220,9 @@ def main():
             raise ValueError(
                 f"fold must be between 0 and k_folds - 1 = {k_folds - 1}, got {cfg.fold}"
             )
-        # the scores of the test fold are needed to merge the folds
+        # the fold is evaluated on its test events (the scores are saved only
+        # with --save-numpy, the merge evaluates the models again in memory)
         cfg.eval = True
-        args.save_numpy = True
     elif cfg.fold is not None:
         raise ValueError("fold is set but k_folds < 2")
     fold_tag = f"_fold{cfg.fold}" if k_folds >= 2 else ""
@@ -338,6 +346,20 @@ def main():
         num_classes,
         class_info,
     ) = load_data(cfg, cfg.seed)
+
+    if k_folds >= 2 and hasattr(test_loader, "event_rows"):
+        # small record of the split of this fold, checked by the merge
+        fold_info = dict(
+            kfold_test_info(test_loader.event_rows, test_loader.n_events_total),
+            fold=int(cfg.fold),
+            k_folds=k_folds,
+            n_train=int(training_loader.num_events),
+            n_val=int(val_loader.num_events) if val_loader is not None else 0,
+            seed=int(cfg.seed),
+            weights_seed=int(cfg.seed) * k_folds + int(cfg.fold),
+        )
+        with open(f"{main_dir}/kfold_fold_info.json", "w") as f:
+            json.dump(fold_info, f, indent=2)
 
     # plot the input variable distributions of signal and background before
     # training. With the k-fold cache the events are the same for all the
