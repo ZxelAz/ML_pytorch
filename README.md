@@ -368,7 +368,7 @@ val_fraction: 0.2            # validation with the ratio train : val
 ```
 
 * **Splitting.** With `kfold_split: random` the events are assigned randomly to the folds, after the seeded shuffle. With `kfold_split: event` the fold of an event is `event % K`, computed from the `kfold_event_column` column (it must be saved in the input files). With `K = 2` this is the even/odd split. `test_fraction` is not used; the sum of the three fractions is still the fraction of the events read from the files.
-* **Seeds.** The event shuffle and the folds depend only on `seed`, so they are identical for all the folds (and for folds trained in separate jobs). The weight initialisation and dropout of fold `k` use the seed `seed * K + k`, so every fold starts from different weights.
+* **Seeds.** The event shuffle and the folds depend only on `seed`, so they are identical for all the folds (and for folds trained in separate jobs). The weight initialisation and dropout of fold `k` use their own random stream, seeded with numpy's `SeedSequence([seed, k])`. The streams are statistically independent and different for every fold and every seed, so every fold starts from different, independently drawn weights.
 * **Oversampling.** The test fold is never oversampled, so every event gets exactly one out-of-fold score; its events get the class-balancing weights instead. The events of the other folds are oversampled in one of two orders:
   * `oversample_split`: oversample first, then split into training and validation. Copies of the same event can therefore be in both training and validation.
   * `split_oversample`: split into training and validation first, then oversample each of them separately.
@@ -407,7 +407,7 @@ With `-s-n/--save-numpy` all the scores are saved: `fold_<k>/score_lbl_array.npz
 * every fold was trained with the test events expected from the split. Each fold writes the number and a sha256 fingerprint of its test events to `fold_<k>/kfold_fold_info.json`;
 * the test folds are disjoint and together contain every event exactly once.
 
-The weight initialisation is different for every fold (seed `seed * K + fold`).
+The weight initialisation of every fold is independent (seed `SeedSequence([seed, fold])`, recorded as `weights_seed` in `kfold_fold_info.json`).
 
 ### Outputs
 

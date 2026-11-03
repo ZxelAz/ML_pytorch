@@ -97,7 +97,8 @@ test_fraction: 0.25
 # three fractions is still the fraction of the events that is read). In this
 # way every event gets an unbiased (out-of-fold) score. The event shuffling
 # and the folds are fixed by seed (the same for all the folds), while the
-# weight initialisation of fold k uses the seed seed * k_folds + k.
+# weight initialisation (and dropout) of fold k uses its own independent
+# random stream, seeded with numpy SeedSequence([seed, k]).
 # The outputs of each fold go to <output_dir>/fold_<k>, the combined
 # out-of-fold results to <output_dir>/kfold and the ONNX models (per fold and
 # combined) to <output_dir>/kfold_onnx. 0 or 1 disables the k-folding.

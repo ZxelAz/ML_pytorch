@@ -28,6 +28,7 @@ from ml_pytorch.utils.setup_logger import setup_logger
 from ml_pytorch.utils.tools import (
     eval_model,
     export_onnx,
+    kfold_weights_seed,
     resolve_input_variables,
     get_model_parameters_number,
     save_pytorch_model,
@@ -356,7 +357,7 @@ def main():
             n_train=int(training_loader.num_events),
             n_val=int(val_loader.num_events) if val_loader is not None else 0,
             seed=int(cfg.seed),
-            weights_seed=int(cfg.seed) * k_folds + int(cfg.fold),
+            weights_seed=kfold_weights_seed(cfg.seed, cfg.fold),
         )
         with open(f"{main_dir}/kfold_fold_info.json", "w") as f:
             json.dump(fold_info, f, indent=2)
@@ -408,8 +409,9 @@ def main():
 
     if k_folds >= 2:
         # the events and the folds are the same for all the folds (seed), while
-        # the weight initialisation (and dropout) is different for each fold
-        weights_seed = int(cfg.seed) * k_folds + cfg.fold
+        # the weight initialisation (and dropout) of every fold uses its own,
+        # independent random stream
+        weights_seed = kfold_weights_seed(cfg.seed, cfg.fold)
         logger.info(
             f"Fold {cfg.fold}: seed {cfg.seed} for the events, seed "
             f"{weights_seed} for the weight initialisation"

@@ -16,6 +16,16 @@ def get_model_parameters_number(model):
     return params_num
 
 
+def kfold_weights_seed(seed, fold):
+    """Seed of the weight initialisation (and dropout) of a fold of the
+    k-fold training. It is derived from (seed, fold) with numpy's
+    SeedSequence, which hashes them into well-mixed seeds meant for
+    statistically independent random streams in parallel jobs: different for
+    every fold and for every seed, without the overlaps of consecutive
+    integer seeds (e.g. seed * k_folds + fold)."""
+    return int(np.random.SeedSequence([int(seed), int(fold)]).generate_state(1)[0])
+
+
 def set_seed(seed, deterministic=False):
     """Seed the python, numpy and torch (CPU and GPU) random number generators.
 
