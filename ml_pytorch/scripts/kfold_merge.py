@@ -13,7 +13,9 @@ fold k. This script:
   - collects the best ONNX model of each fold and builds the combined ONNX
     models (<main_dir>/kfold_onnx/): average of the outputs, average of the
     ratios of the outputs (reweighting) and, with kfold_split event, the model
-    that evaluates every event with the model of the fold event % k_folds
+    that evaluates every event with the model of the fold event % k_folds;
+    with the ratio (reweighting) or the multiclass morphing weight, also the
+    per-event median over the folds of the weight
 """
 
 import argparse
@@ -46,6 +48,8 @@ KFOLD_ONNX_NAMES = {
     "event": "event_fold_model_kfold.onnx",
     "event_ratio": "event_fold_ratio_model_kfold.onnx",
     "average_morphing": "average_morphing_model_kfold.onnx",
+    "median_ratio": "median_ratio_model_kfold.onnx",
+    "median_morphing": "median_morphing_model_kfold.onnx",
     "event_morphing": "event_fold_morphing_model_kfold.onnx",
 }
 # copy of the combined model chosen with kfold_onnx (and onnx_ratio)
@@ -54,15 +58,27 @@ KFOLD_FINAL_ONNX_NAME = "final_model_kfold.onnx"
 
 def final_onnx_key(kfold_onnx, ratio, morphing=False):
     """Key in KFOLD_ONNX_NAMES of the final model chosen with kfold_onnx."""
+    if kfold_onnx == "median":
+        # the median is taken over the folds of the weight of each fold
+        if morphing:
+            return "median_morphing"
+        if ratio:
+            return "median_ratio"
+        raise ValueError(
+            "kfold_onnx: median is the median over the folds of the weight: it "
+            "needs onnx_ratio (--ratio) or morphing_alpha (--alpha)"
+        )
     if morphing:
         if kfold_onnx not in ["average", "event"]:
-            raise ValueError(f"kfold_onnx must be average or event, got {kfold_onnx}")
+            raise ValueError(
+                f"kfold_onnx must be average, event or median, got {kfold_onnx}"
+            )
         return f"{kfold_onnx}_morphing"
     if kfold_onnx == "average":
         return "average_ratio" if ratio else "average"
     if kfold_onnx == "event":
         return "event_ratio" if ratio else "event"
-    raise ValueError(f"kfold_onnx must be average or event, got {kfold_onnx}")
+    raise ValueError(f"kfold_onnx must be average, event or median, got {kfold_onnx}")
 
 
 def get_fold_dirs(main_dir, k_folds):
@@ -319,17 +335,14 @@ def morphing_weights(fold_out, event, k_folds, alpha, alpha_den):
 
     nums = [o[:, 0] - alpha * o[:, 2] for o in fold_out]
     dens = [o[:, 1] - alpha_den * o[:, 3] for o in fold_out]
-    avg_num = np.maximum(np.mean(nums, axis=0), 0)
-    avg_den = np.mean(dens, axis=0)
-    if alpha_den:
-        avg_den = np.maximum(avg_den, 0)
     fold_w = [
         (np.maximum(n, 0) if alpha else n)
         / ((np.maximum(d, 0) if alpha_den else d) + RATIO_DEN_EPS)
         for n, d in zip(nums, dens)
     ]
     return {
-        "average_morphing": avg_num / (avg_den + RATIO_DEN_EPS),
+        "average_morphing": np.mean(fold_w, axis=0),
+        "median_morphing": np.median(fold_w, axis=0),
         "event_morphing": np.choose(event % k_folds, fold_w),
     }
 
@@ -347,9 +360,10 @@ def check_kfold_models(fold_files, kfold_files, n_features, k_folds, morphing=No
     expected = {"average": np.mean(fold_out, axis=0), "event": selected}
     if morphing is not None:
         expected.update(morphing_weights(fold_out, event, k_folds, *morphing))
-    if "average_ratio" in kfold_files or "event_ratio" in kfold_files:
+    if any(k in kfold_files for k in ["average_ratio", "median_ratio", "event_ratio"]):
         fold_ratios = [ratio_of_outputs(o) for o in fold_out]
         expected["average_ratio"] = np.mean(fold_ratios, axis=0)
+        expected["median_ratio"] = np.median(fold_ratios, axis=0)
         expected["event_ratio"] = np.choose(event % k_folds, fold_ratios)
 
     for key, model_file in kfold_files.items():
@@ -371,7 +385,8 @@ def merge_onnx(
     """Copy the best model of each fold, build the combined models and save
     the one chosen with kfold_onnx as the final model. With ``alpha`` (4-node
     multiclass morphing models) the final model is the morphing weight with
-    the ttbar subtraction (see build_multiclass_morphing_models)."""
+    the ttbar subtraction (see build_multiclass_morphing_models). With
+    kfold_onnx median it is the median over the folds of the weight."""
     folds_dir = f"{out_dir}/folds"
     os.makedirs(folds_dir, exist_ok=True)
     fold_files = []
@@ -399,6 +414,8 @@ def merge_onnx(
                 f"multiclass morphing give the ttbar fraction alpha)"
             )
         ratio = False
+    # fail before building the models if the chosen final model does not exist
+    final_key = final_onnx_key(kfold_onnx, ratio, morphing)
 
     combined = build_kfold_models(
         onnx_models, n_features, ratio=ratio, event_split=event_split
@@ -422,7 +439,6 @@ def merge_onnx(
         morphing=(alpha, alpha_den) if morphing else None,
     )
 
-    final_key = final_onnx_key(kfold_onnx, ratio, morphing)
     kfold_files["final"] = f"{out_dir}/{KFOLD_FINAL_ONNX_NAME}"
     shutil.copy(kfold_files[final_key], kfold_files["final"])
     logger.info(
@@ -440,6 +456,9 @@ def merge_kfold(main_dir, cfg, ratio=None, plots=True, save_numpy=False):
     event_split = cfg.kfold_split == "event"
     if cfg.kfold_onnx == "event" and not event_split:
         raise ValueError("kfold_onnx: event needs kfold_split: event")
+    if cfg.onnx and cfg.kfold_onnx == "median":
+        # before the (long) evaluation of the out-of-fold scores
+        final_onnx_key("median", ratio, cfg.get("morphing_alpha", None) is not None)
 
     fold_dirs = get_fold_dirs(main_dir, k_folds)
     kfold_dir = f"{main_dir}/kfold"
@@ -532,8 +551,8 @@ def main():
     parser.add_argument(
         "--kfold-onnx",
         default=None,
-        choices=["average", "event"],
-        help="Final ONNX model (overrides config): average over the folds or model of the fold event %% k_folds",
+        choices=["average", "event", "median"],
+        help="Final ONNX model (overrides config): average over the folds, model of the fold event %% k_folds, or median over the folds of the weight (needs --ratio or --alpha)",
     )
     parser.add_argument(
         "-al",

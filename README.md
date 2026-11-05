@@ -297,7 +297,7 @@ K-fold training (see K-fold training)
   --onnx-ratio                 Also build the average-of-ratios k-fold ONNX model
   --kfold-cache DIR            Load the events once in DIR and memory-map them in all the folds
   --kfold-prepare              Only prepare the k-fold cache and exit
-  --kfold-onnx {average,event} Final k-fold ONNX model: average over the folds or fold event % k_folds
+  --kfold-onnx {average,event,median} Final k-fold ONNX model: average over the folds, fold event % k_folds, or median over the folds of the weight
 
 Evaluation / output
   -ev, --eval                  Evaluate the model on the test set (no training)
@@ -362,7 +362,7 @@ k_folds: 5
 kfold_split: random          # or: event
 kfold_event_column: event    # used with kfold_split: event
 onnx_ratio: False            # also build the average-of-ratios ONNX (reweighting)
-kfold_onnx: average          # final ONNX model: average | event (see Outputs)
+kfold_onnx: average          # final ONNX model: average | event | median (see Outputs)
 train_fraction: 0.8          # the non-test events are split into training and
 val_fraction: 0.2            # validation with the ratio train : val
 ```
@@ -418,10 +418,12 @@ The weight initialisation of every fold is independent (seed `SeedSequence([seed
 * `kfold_onnx/folds/model_fold<k>.onnx`: the best model of each fold.
 * `kfold_onnx/average_model_kfold.onnx`: the average of the outputs of the K models (input `args_0`, output `avg_score`). Use it for events that were not used in the training.
 * `kfold_onnx/average_ratio_model_kfold.onnx` (`onnx_ratio: True` or `--ratio`): the average over the folds of the ratio of the outputs (`p/(1-p)` for one output node, `p1/p0` for two), output `avg_w`, for the background reweighting. Equivalent to `ml_onnx -ar` on the fold models.
-* `kfold_onnx/average_morphing_model_kfold.onnx` (and `event_fold_morphing_model_kfold.onnx` with `kfold_split: event`): for the 4-node multiclass morphing, when `morphing_alpha` (`ml_kfold_merge --alpha`) is given. It is the morphing weight with the ttbar subtraction, the same as `ml_onnx -ar -mc` on the fold models, and it becomes the final model; see [Boosted HH4b: multiclass background morphing](#boosted-hh4b-multiclass-background-morphing).
+* `kfold_onnx/average_morphing_model_kfold.onnx` (and `event_fold_morphing_model_kfold.onnx` with `kfold_split: event`): for the 4-node multiclass morphing, when `morphing_alpha` (`ml_kfold_merge --alpha`) is given. It is the morphing weight with the ttbar subtraction, the same as `ml_onnx -ar -mc` on the fold models, and it becomes the final model. For each event it is the mean over the folds of the weight of each fold, `relu(r_0 - α r_2) / (relu(r_1 - α_den r_3) + eps)` (not the average numerator over the average denominator); see [Boosted HH4b: multiclass background morphing](#boosted-hh4b-multiclass-background-morphing).
+* `kfold_onnx/median_ratio_model_kfold.onnx` (`onnx_ratio: True` or `--ratio`) and `kfold_onnx/median_morphing_model_kfold.onnx` (`morphing_alpha`): for each event, the **median over the folds of the weight** of each fold (the ratio of the outputs, or the 4-node morphing weight `relu(r_0 - α r_2) / (relu(r_1 - α_den r_3) + eps)`), output `med_w`. The scores, numerators and denominators are not changed. Unlike the average, one fold with an outlying weight (e.g. a near-zero denominator) cannot move it. For an even K it is the mean of the two middle weights, and with K = 2 it is equal to the average.
 * `kfold_onnx/event_fold_model_kfold.onnx` (and `event_fold_ratio_model_kfold.onnx` with the ratio), only with `kfold_split: event`. It takes two inputs: `args_0`, the input variables `(N, n_features)` float32, and `event`, the event number `(N,)` int64. Each event is evaluated with the model of fold `event % K`, which is the model that was **not** trained on it. Use it for the events that were used in the training (e.g. the training regions).
 * `kfold_onnx/final_model_kfold.onnx`: a copy of the combined model chosen with `kfold_onnx`. Its ratio variant is used when `onnx_ratio` is set. The choice is also written in `kfold/kfold_summary.yml` (`final_onnx`).
   * `kfold_onnx: average` (default) gives the average over the folds. Use it when the model is applied to events that were not used in the training, e.g. the background reweighting applied in a separate region.
+  * `kfold_onnx: median` gives the median over the folds of the weight, as an alternative to the average for events that were not used in the training. It needs `onnx_ratio` or `morphing_alpha`, otherwise there is no weight and the merge stops with an error.
   * `kfold_onnx: event` gives the event-number-aware model and needs `kfold_split: event`. Use it when the model is also applied to the training events, e.g. the sig/bkg or ggF/VBF classifiers. Events whose number was never seen in the training can be evaluated by any fold, so the same model works for them too.
 
 The combined models are checked against the per-fold models with onnxruntime when they are built. To use the per-fold models by hand with `K = 2`, apply `model_fold0.onnx` to the **even** events and `model_fold1.onnx` to the **odd** events.
@@ -641,7 +643,7 @@ and the two alphas, and `--json <file>` saves them.
 in `<outdir>/alpha.json`) and passes it to the conversion:
 * `ml_onnx -ar -mc -al <alpha> -ald <alpha_den>` for the trainings with several seeds;
 * `ml_kfold_merge --alpha <alpha> --alpha-den <alpha_den>` with `--k-folds`. The final model,
-  `kfold_onnx/final_model_kfold.onnx`, is then the morphing weight averaged over the folds.
+  `kfold_onnx/final_model_kfold.onnx`, is then the morphing weight averaged over the folds (or, with `kfold_onnx: median`, the median over the folds of the weight of each fold, `kfold_onnx/median_morphing_model_kfold.onnx`).
 
 `alpha_den` is `0.0` (no ttbar subtraction in the denominator) unless `--alpha-den-computed` is given; then the
 computed alpha of the denominator region is used.
