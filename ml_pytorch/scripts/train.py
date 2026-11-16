@@ -28,6 +28,7 @@ from ml_pytorch.utils.setup_logger import setup_logger
 from ml_pytorch.utils.tools import (
     eval_model,
     add_training_state,
+    copy_input_variables_file,
     export_onnx,
     kfold_weights_seed,
     resolve_input_variables,
@@ -100,6 +101,7 @@ def run_all_folds(cfg, main_dir):
     make_output_dir(main_dir, cfg.overwrite)
     setup_logger(f"{main_dir}/logger_kfold.log", cfg.verbosity)
     os.system(f"cp {args.config} {main_dir}")
+    copy_input_variables_file(cfg, main_dir)
     # the events are loaded only once, in the k-fold cache, which by default
     # is a temporary directory (not to fill the output disk), removed at the
     # end; only the record of the split is kept in the output directory
@@ -281,9 +283,10 @@ def main():
     logger.info(f"Output directory: {main_dir}")
 
     if not cfg.eval_model and not cfg.load_model:
-        logger.info("Copying ML model and config to output directory")
+        logger.info("Copying ML model, config and input variables to output directory")
         os.system(f"cp {ML_model_path} {saved_ML_model_path}")
         os.system(f"cp {args.config} {main_dir}")
+        copy_input_variables_file(cfg, main_dir)
         # dump cfg in yml file
         cfg_out_file_name = f"{main_dir}/config_parameters.yml"
         OmegaConf.save(cfg, cfg_out_file_name)

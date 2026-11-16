@@ -1,4 +1,6 @@
 import importlib
+import importlib.util
+import shutil
 import torch
 import numpy as np
 import os
@@ -488,6 +490,15 @@ def resolve_input_variables(cfg):
         cfg.input_variables = create_DNN_columns_list(
             cfg.run2, dnn_input_variables_file.dnn_input_variables
         )
+
+
+def copy_input_variables_file(cfg, out_dir):
+    """Copy the input variables module (cfg.input_variables, if it is the
+    name of a module in ml_pytorch/defaults/) to the output directory."""
+    if isinstance(cfg.input_variables, str):
+        spec = importlib.util.find_spec(f"ml_pytorch.defaults.{cfg.input_variables}")
+        if spec is not None and spec.origin:
+            shutil.copy(spec.origin, out_dir)
 
 
 def eval_model(model, loader, loss_fn, type_eval, device, best_epoch):
