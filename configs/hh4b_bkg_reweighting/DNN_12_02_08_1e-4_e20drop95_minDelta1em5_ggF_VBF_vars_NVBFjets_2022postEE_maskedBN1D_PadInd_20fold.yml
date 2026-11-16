@@ -1,0 +1,85 @@
+# Background morphing (2b -> 4b control region) on the 2022 postEE JetMET
+# data, with the input variables of the ggF/VBF classifier plus the number of
+# VBF jets. 20-fold version, as for the 2024 configs
+# (DNN_12_01_04_1e-4_e20drop95_minDelta1em5_ggF_VBF_vars_NVBFjets_2024_parking_kfold20.yml).
+#
+# Run the 20 folds at the same time on one full 8-GPU node (t3gpu0X: 8 GTX
+# 1080 Ti, 40 CPUs, ~245 GB) and merge them:
+#   ./jobs/run_training.sh -c <this config> -o <output dir> \
+#     -k 20 -g 8 --cpus 40 --mem-per-cpu 6000 --time 48:00:00 --ratio
+# The events are first loaded once into <output dir>/kfold_cache, which the 20
+# fold processes memory-map (the events take the RAM once, not 20 times).
+# Folds i run on GPU i % 8 (3 folds on GPUs 0-3, 2 on GPUs 4-7), with 2 CPUs
+# each.
+input_variables: bkg_morphing_dnn_ggf_vbf_NVBFjets_input_variables
+
+run2: False
+
+signal_sample: [DATA_JetMET_HH4bResolved]
+background_sample: [DATA_JetMET_HH4bResolved]
+
+signal_region: [4b_control_region]
+background_region: [2b_control_region_preW]
+
+signal_dataset:
+  [
+    DATA_JetMET_2022_postEE_EraE,
+    DATA_JetMET_2022_postEE_EraF,
+    DATA_JetMET_2022_postEE_EraG,
+  ]
+background_dataset:
+  [
+    DATA_JetMET_2022_postEE_EraE,
+    DATA_JetMET_2022_postEE_EraF,
+    DATA_JetMET_2022_postEE_EraG,
+  ]
+
+# with the k-folding the oversampling is done after the split into folds, in
+# the training and validation datasets only (the test fold is not oversampled)
+oversample_split: True
+
+# K-fold training: 20 folds assigned randomly (no event number needed). The
+# morphing weights are applied to the events of a separate region, so the
+# final ONNX model is the average over the folds of the ratio of the outputs
+# (kfold_onnx/kfold_morphing_ratio_average.onnx).
+k_folds: 20
+kfold_split: random
+kfold_onnx: average
+onnx_ratio: True
+
+ML_model: DNN_softmax_reweight_model_maskedBN1D
+
+data_format: parquet
+
+batch_size: 512
+epochs: 100
+
+learning_rate: 1e-4
+learning_rate_schedule: e20_drop95
+
+early_stopping: True
+patience: 20
+min_delta: 1e-5
+
+eval_param: "loss"
+
+# reshuffle the training events at every epoch
+shuffle_train: True
+
+# With the k-folding the test dataset is the fold (1/20 of the events) and the
+# other events are split into training and validation with the ratio
+# train_fraction : val_fraction. The sum of the fractions is the fraction of
+# events read, so it is kept at 1.
+train_fraction: 0.9
+val_fraction: 0.1
+test_fraction: 0.0
+
+# Keep the datasets of a fold in RAM and slice the batches there before
+# copying them to the GPU (much faster than the DataLoaders).
+data_on_gpu: True
+
+pad_value: -999.0
+pad_fill_value: 0.0
+pad_indicators: True
+
+data_dirs: [/work/mmalucch/out_hh4b/VBF/12_02_01_out_DATA_AllKlambda_DetaMjjCentrality_DNNVars_vbfregions_2022postEE]
