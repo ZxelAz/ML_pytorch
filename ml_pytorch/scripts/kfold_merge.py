@@ -16,6 +16,7 @@ fold k. This script:
     that evaluates every event with the model of the fold event % k_folds;
     with the ratio (reweighting) or the multiclass morphing weight, also the
     per-event median over the folds of the weight
+With --onnx-only only the combined ONNX models are built (no events loaded).
 """
 
 import argparse
@@ -483,7 +484,10 @@ def merge_onnx(
     return kfold_files, final_key
 
 
-def merge_kfold(main_dir, cfg, ratio=None, plots=True, save_numpy=False):
+def merge_kfold(main_dir, cfg, ratio=None, plots=True, save_numpy=False, onnx_only=False):
+    """With ``onnx_only`` only the combined ONNX models are built: the fold
+    metrics, the out-of-fold scores and the plots are skipped, and only the
+    final model of the existing kfold_summary.yml is updated."""
     k_folds = cfg.k_folds
     if not k_folds or k_folds < 2:
         raise ValueError(f"k_folds must be >= 2 to merge the folds, got {k_folds}")
@@ -500,15 +504,23 @@ def merge_kfold(main_dir, cfg, ratio=None, plots=True, save_numpy=False):
     os.makedirs(kfold_dir, exist_ok=True)
 
     check_fold_configs(fold_dirs)
-    fold_metrics = [read_fold_metrics(d) for d in fold_dirs]
-    summary = summarise_metrics(fold_metrics)
     summary_file = f"{kfold_dir}/kfold_summary.yml"
+    if onnx_only:
+        # keep the metrics of a previous full merge
+        summary = (
+            OmegaConf.to_container(OmegaConf.load(summary_file))
+            if os.path.exists(summary_file)
+            else {}
+        )
+    else:
+        fold_metrics = [read_fold_metrics(d) for d in fold_dirs]
+        summary = summarise_metrics(fold_metrics)
 
-    merged = merge_scores(
-        cfg, fold_dirs, kfold_dir, save=bool(save_numpy or cfg.get("save_numpy", False))
-    )
+        merged = merge_scores(
+            cfg, fold_dirs, kfold_dir, save=bool(save_numpy or cfg.get("save_numpy", False))
+        )
 
-    if plots and (cfg.histos or cfg.roc):
+    if not onnx_only and plots and (cfg.histos or cfg.roc):
         from ml_pytorch.scripts.sig_bkg_eval import (
             plot_kl_distributions_with_fallback,
         )
@@ -623,6 +635,11 @@ def main():
     parser.add_argument(
         "--no-plots", action="store_true", help="Do not plot the out-of-fold scores"
     )
+    parser.add_argument(
+        "--onnx-only",
+        action="store_true",
+        help="Only build the combined ONNX models (average / median / event, chosen with --kfold-onnx), skipping the fold metrics, the out-of-fold evaluation and the plots (no events loaded); updates final_onnx in the existing kfold/kfold_summary.yml",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -655,8 +672,15 @@ def main():
         cfg.morphing_alpha = args.alpha
     if args.alpha_den is not None:
         cfg.morphing_alpha_den = args.alpha_den
+    if args.onnx_only:
+        cfg.onnx = True
     merge_kfold(
-        main_dir, cfg, ratio=args.ratio, plots=not args.no_plots, save_numpy=args.save_numpy
+        main_dir,
+        cfg,
+        ratio=args.ratio,
+        plots=not args.no_plots,
+        save_numpy=args.save_numpy,
+        onnx_only=args.onnx_only,
     )
 
 

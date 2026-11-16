@@ -387,6 +387,10 @@ ml_train -c configs/hh4b_sig_bkg_classifier/example_DNN_config_kfold.yml -k 5 -o
 ml_train -c config.yml -k 5 --fold 3 -o out/kfold/fold_3
 ml_kfold_merge -i out/kfold -c config.yml -k 5 [--ratio]
 
+# only (re)build the combined ONNX models, e.g. the median of the ratios, skipping
+# the fold metrics, the out-of-fold evaluation and the plots (no events loaded)
+ml_kfold_merge -i out/kfold --ratio --kfold-onnx median --onnx-only
+
 # Slurm: the folds in parallel (here on 1 node) and merged at the end
 ./jobs/run_training.sh -c /full/path/config.yml -o /full/path/out/kfold -k 5 [--ratio] [-p NODES]
 ```
@@ -700,6 +704,7 @@ Each training run writes to `${output_dir}` (default `/work/$USER/out_ML_pytorch
 
 * `config_parameters.yml` — full resolved config (defaults + CLI + YAML) snapshot.
 * `ML_model.py` — copy of the model file used, so a saved run can be re-loaded with `-l`/`--load-model` even after the file in `ml_pytorch/models/` changes.
+* `<input_variables>.py` — copy of the input variables module from `ml_pytorch/defaults/`, when `input_variables` is given as a module name.
 * `logger_<name>.log` — training log with epoch-by-epoch loss / accuracy / learning rate.
 * `state_dict/model_<epoch>_state_dict.pt` — checkpoints of the last `n_best_checkpoints` (default 5) best epochs and of the last epoch; older best-epoch checkpoints are removed automatically.
 * `state_dict/model_best_epoch_<n>.onnx` — ONNX export of the best model (and one for the last epoch).
