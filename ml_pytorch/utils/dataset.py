@@ -887,7 +887,6 @@ def _find_class_files(cfg, class_def):
                 raise ValueError("parquet_dir can be used only with a single data_dir")
             for direct in cfg.data_dirs:
                 if parquet_dir is not None:
-                    # e.g. the files merged with merge_parquet.py of AnalysisConfigs
                     parquet_dirs_path = parquet_dir
                     logger.info(
                         f"Reading the parquet files from parquet_dir {parquet_dirs_path} "

@@ -167,7 +167,7 @@ A ready-to-edit multi-class example is provided at `configs/hh4b_sig_bkg_classif
 | `preprocess_variables_functions` | mapping `{var: [func_name, [args...]]}` resolved against `ml_pytorch/defaults/preprocess_variables_functions.py` |
 | `data_format` | `coffea`, `parquet`, or `root` |
 | `data_dirs` | list of directories containing the input files (`.coffea` files / parquet config) |
-| `parquet_dir` | parquet only: directory of the parquet files to use instead of the `save_chunk` one in the `config.json` of `data_dirs` (single `data_dir` only), e.g. the output of `merge_parquet.py` of AnalysisConfigs ([Merge the parquet chunks](#merge-the-parquet-chunks)) |
+| `parquet_dir` | parquet only: directory of the parquet files to use instead of the `save_chunk` one in the `config.json` of `data_dirs` (single `data_dir` only) |
 | `oversample_split`, `split_oversample`, `undersample` | binary-only class balancing strategies |
 | `eval`, `roc`, `histos`, `history`, `onnx` | toggle the post-training outputs |
 | `gpus` | comma-separated GPU indices, or unset for CPU |
