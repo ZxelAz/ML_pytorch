@@ -737,19 +737,6 @@ ml_sb -i <training_directory> -klb full
 ml_input_vars -c <config_file> -o <output_directory>
 ```
 
-### Merge the parquet chunks
-
-Loading thousands of small parquet chunks from dCache (`/pnfs`) is dominated by the per-file latency (~1-2 min per dataset/region even for few MB). The chunks can be merged once into a single `merged.parquet` per leaf directory (e.g. `<dataset>/<region>/nominal`), keeping the directory structure and the events order, with `merge_parquet.py`, which is now in [AnalysisConfigs](https://github.com/matteomalucchi/AnalysisConfigs) (`utils_configs/merge_parquet.py`, see the [AnalysisConfigs HH4b README](https://github.com/matteomalucchi/AnalysisConfigs/blob/main/configs/HH4b_common/README.md#merge-the-parquet-chunks) for all the options). It can run automatically at the end of the PocketCoffea run (`run_pocket_coffea ... --merge-parquet`) or by hand:
-
-```bash
-# in AnalysisConfigs; by default the merged files are written in <...>/merged_parquet_files next to <...>/parquet_files
-python utils_configs/merge_parquet.py -i <data_dir> [-o <merged_dir>] [--tmp-dir <tmp_dir>] [--update-config]
-```
-
-Then either:
-
-* set `parquet_dir: <merged_dir>` (e.g. `<...>/merged_parquet_files`) in the training config, or
-* merge with `--update-config` (`run_pocket_coffea ... --merge-parquet-update-config`), which overwrites the parquet path (`save_chunk` and `dump_columns_as_arrays_per_chunk`) in the `config.json` of `data_dir` with the merged directory: the merged files are then read without setting `parquet_dir`
 
 ## Input variable distributions
 
